@@ -1,0 +1,24 @@
+.vscode/**
+.vscode-test/**
+.kiro/**
+src/**
+out/**
+temp/**
+node_modules/**
+.gitignore
+.yarnrc
+.DS_Store
+**/.DS_Store
+webpack.config.js
+vsc-extension-quickstart.md
+eslint.config.mjs
+**/tsconfig.json
+**/.eslintrc.json
+**/*.map
+**/*.ts
+**/*.map
+.vscode-test.mjs
+package-lock.json
+*.vsix
+# Source for icon.png; not needed at runtime
+resources/icon.svg
