@@ -1,6 +1,6 @@
-# Kiro CLI Chat
+# Kiro CLI Companion
 
-A chat panel for the [Kiro CLI](https://kiro.dev) inside VS Code. It works on Windows, macOS and Linux.
+A companion for the [Kiro CLI](https://kiro.dev) inside VS Code: chat beside your code, plan features, manage rules, and see what Kiro uses. Works on Windows, macOS and Linux.
 
 > Requires `kiro-cli`, installed separately from [kiro.dev](https://kiro.dev). This is a community extension, not an official Kiro product.
 

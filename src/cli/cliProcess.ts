@@ -518,8 +518,11 @@ export class CliProcess implements vscode.Disposable {
             _log.appendLine(`[ACP] response id=${id}, hasError=${!!parsed.error}`);
 
             if (parsed.error) {
-                const err = parsed.error as { message?: string; code?: number };
-                const error = new Error(err.message || 'ACP error') as Error & { code?: number };
+                const err = parsed.error as { message?: string; code?: number; data?: unknown };
+                // kiro-cli puts the useful explanation in `data`, e.g.
+                // "Failed to start session: Session is active in another process (PID 1234)"
+                const detail = typeof err.data === 'string' && err.data.trim() ? `: ${err.data.trim()}` : '';
+                const error = new Error((err.message || 'ACP error') + detail) as Error & { code?: number };
                 error.code = err.code;
                 pending.reject(error);
             } else {

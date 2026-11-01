@@ -1,18 +1,18 @@
 {
-    "name": "kiro-cli-chat",
-    "displayName": "Kiro CLI Chat",
-    "description": "VS Code UI wrapper for the Kiro CLI — chat with AI agents, run Spec workflows, and get context-aware coding help. Requires Kiro CLI (kiro-cli) installed separately from kiro.dev.",
+    "name": "kiro-cli-companion",
+    "displayName": "Kiro CLI Companion",
+    "description": "Unofficial companion for the Kiro CLI: chat beside your code, plan features with specs, manage rules, and see what Kiro uses. Requires kiro-cli from kiro.dev.",
     "version": "0.1.0",
     "publisher": "Takobaba",
     "author": "Takobaba",
     "license": "MIT",
     "repository": {
         "type": "git",
-        "url": "https://github.com/takobaba/kiro-cli-copilot"
+        "url": "https://github.com/takobaba/kiro-cli-companion"
     },
-    "homepage": "https://github.com/takobaba/kiro-cli-copilot#readme",
+    "homepage": "https://github.com/takobaba/kiro-cli-companion#readme",
     "bugs": {
-        "url": "https://github.com/takobaba/kiro-cli-copilot/issues"
+        "url": "https://github.com/takobaba/kiro-cli-companion/issues"
     },
     "icon": "resources/icon.png",
     "engines": {
@@ -101,7 +101,7 @@
             "activitybar": [
                 {
                     "id": "kiro",
-                    "title": "Kiro CLI Chat",
+                    "title": "Kiro CLI Companion",
                     "icon": "resources/activitybar.svg"
                 }
             ]
@@ -110,7 +110,7 @@
             "kiro": [
                 {
                     "id": "kiro.launcher",
-                    "name": "Kiro CLI Chat",
+                    "name": "Kiro CLI Companion",
                     "icon": "resources/activitybar.svg"
                 },
                 {
