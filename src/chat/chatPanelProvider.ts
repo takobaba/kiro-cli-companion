@@ -15,6 +15,7 @@ import { execFile } from 'child_process';
 import { cliSpawnTarget } from '../cli/cliLocator';
 import { CliManager } from '../cli/cliManager';
 import { CliProcess, MODE_CONFIG_ID } from '../cli/cliProcess';
+import { AppliedRule, Rule, formatRulesBlock, rulesToAttach } from '../rules/rules';
 import { WorkspaceContextProvider } from '../context/workspaceContextProvider';
 import type { ExtToWebviewMessage, WebviewToExtMessage, ContextUsage } from '../types';
 
@@ -40,6 +41,11 @@ export class ChatPanelProvider implements vscode.Disposable {
 
     /** Callback for spec cancel action. */
     private _onSpecCancel: (() => void) | null = null;
+
+    private _specIsActive: (() => boolean) | null = null;
+    private _specBuildRevision: ((text: string) => string) | null = null;
+    private _specBeginTurn: (() => void) | null = null;
+    private _getRules: (() => Rule[]) | null = null;
 
     /**
      * Tracks the last known text editor so we can capture context even when
@@ -159,6 +165,22 @@ export class ChatPanelProvider implements vscode.Disposable {
     }
 
     /**
+     * While a spec is in progress, messages typed in the chat are revisions of
+     * the current document: they're rewritten by `buildRevision` and the reply
+     * replaces the captured document (`beginTurn` resets the capture).
+     */
+    setSpecSession(isActive: () => boolean, buildRevision: (text: string) => string, beginTurn: () => void): void {
+        this._specIsActive = isActive;
+        this._specBuildRevision = buildRevision;
+        this._specBeginTurn = beginTurn;
+    }
+
+    /** Supplies the current rule files so fileMatch/#manual rules can be attached. */
+    setRulesSource(getRules: () => Rule[]): void {
+        this._getRules = getRules;
+    }
+
+    /**
      * Opens or reveals the chat panel.
      * Creates a new panel if one doesn't exist, otherwise brings it to focus.
      * The panel occupies 1/4 of the editor width and files won't open in its column.
@@ -240,6 +262,10 @@ export class ChatPanelProvider implements vscode.Disposable {
     private async _sendPromptInternal(promptText: string, isSpecPrompt: boolean = false): Promise<void> {
         // Send loading start
         this._postMessage({ type: 'loading', active: true });
+        // The reply to this turn becomes the spec document (replacing earlier drafts)
+        if (isSpecPrompt) {
+            this._specBeginTurn?.();
+        }
 
         try {
             const cliProcess = await this._cliManager.ensureProcess();
@@ -336,8 +362,45 @@ export class ChatPanelProvider implements vscode.Disposable {
         // very first characters, otherwise they're sent to the model as plain
         // text. Send them without editor context.
         const isSlashCommand = text.trimStart().startsWith('/');
-        const promptText = isSlashCommand ? text.trim() : this._buildContextEnrichedPrompt(text);
-        await this._sendPromptInternal(promptText, false);
+        if (isSlashCommand) {
+            await this._sendPromptInternal(text.trim(), false);
+            return;
+        }
+
+        // Rules kiro-cli doesn't load itself: fileMatch (active file) and #manual
+        const applied = this._rulesForMessage(text);
+        if (applied.length) {
+            this._postMessage({
+                type: 'systemMessage',
+                message: `📏 Applying rules: ${applied.map((a) => `${a.rule.name} (${a.reason})`).join(', ')}`,
+            });
+        }
+        const rulesBlock = formatRulesBlock(applied);
+
+        const inSpec = this._specIsActive?.() === true && this._specBuildRevision !== null;
+        const body = inSpec ? this._specBuildRevision!(text) : this._buildContextEnrichedPrompt(text);
+        await this._sendPromptInternal(rulesBlock ? `${rulesBlock}\n\n${body}` : body, inSpec);
+    }
+
+    /** fileMatch rules matching the active file, plus manual rules referenced as #name. */
+    private _rulesForMessage(text: string): AppliedRule[] {
+        if (!this._getRules) {
+            return [];
+        }
+        let activeRelative: string | null = null;
+        const editor = this._lastActiveTextEditor;
+        if (editor && !editor.document.isClosed && editor.document.uri.scheme === 'file') {
+            const rel = path.relative(this._cliManager.currentWorkingDirectory, editor.document.uri.fsPath);
+            activeRelative = rel && !rel.startsWith('..') && !path.isAbsolute(rel)
+                ? rel
+                : vscode.workspace.asRelativePath(editor.document.uri, false);
+        }
+        try {
+            return rulesToAttach(this._getRules(), text, activeRelative);
+        } catch (err) {
+            _log.appendLine(`[Chat] Failed to evaluate rules: ${err}`);
+            return [];
+        }
     }
 
     /**

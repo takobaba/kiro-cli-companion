@@ -27,6 +27,13 @@ const SAVE_NOTICE = (specName: string, phase: SpecPhase) =>
     `\n\nIMPORTANT: Do NOT create or write any files. Just output the document content ` +
     `directly in this chat as Markdown. I will save it to .kiro/specs/${specName}/${PHASE_FILES[phase]} myself.`;
 
+/** Plain-language step announcements shown in the chat. */
+const STEP_LABEL: Record<SpecPhase, string> = {
+    requirements: 'Step 1 of 3 — Requirements: what the feature must do.',
+    design: 'Step 2 of 3 — Design: how to build it, based on the requirements.',
+    tasks: 'Step 3 of 3 — Tasks: a step-by-step checklist, based on the design.',
+};
+
 export class SpecWorkflowManager {
     private _currentPhase: SpecPhase | null = null;
     private _specName: string = '';
@@ -77,15 +84,17 @@ export class SpecWorkflowManager {
     async startWorkflow(): Promise<void> {
         // Step 1: Ask for spec name
         const name = await vscode.window.showInputBox({
-            title: 'Spec Name',
-            prompt: 'Enter a name for the new spec (used as folder name)',
-            placeHolder: 'e.g. user-authentication',
+            title: 'Plan a Feature (1/2): Name it',
+            prompt: 'Kiro will write a requirements doc, a design and a task list for this feature, step by step. ' +
+                'This name becomes the folder .kiro/specs/<name>/.',
+            placeHolder: 'e.g. user-login',
+            ignoreFocusOut: true,
             validateInput: (value) => {
                 if (!value || !value.trim()) {
-                    return 'Spec name is required';
+                    return 'A name is required';
                 }
                 if (!/^[a-zA-Z0-9_-]+$/.test(value.trim())) {
-                    return 'Spec name can only contain letters, numbers, hyphens, and underscores';
+                    return 'Use letters, numbers, hyphens and underscores only (no spaces)';
                 }
                 return undefined;
             },
@@ -97,12 +106,14 @@ export class SpecWorkflowManager {
 
         // Step 2: Ask for description
         const description = await vscode.window.showInputBox({
-            title: 'Spec Description',
-            prompt: 'Describe what this spec should cover',
-            placeHolder: 'e.g. Add user authentication with OAuth2 and JWT tokens',
+            title: 'Plan a Feature (2/2): Describe it',
+            prompt: 'What should this feature do? A sentence or two is enough — you can refine everything afterwards.',
+            placeHolder: 'e.g. Let users sign in with Google or GitHub and stay signed in for 30 days',
+            ignoreFocusOut: true,
+            validateInput: (value) => (value && value.trim() ? undefined : 'A short description is required'),
         });
 
-        if (description === undefined) {
+        if (!description) {
             return; // User cancelled
         }
 
@@ -130,10 +141,44 @@ export class SpecWorkflowManager {
 
         this._chatPanelProvider.postMessage({
             type: 'systemMessage',
-            message: `Starting spec workflow: "${this._specName}" — Phase: requirements`,
+            message:
+                `📋 Planning "${this._specName}" in 3 steps. Kiro writes each document here and you review it before moving on:\n` +
+                `  1. Requirements — what to build\n` +
+                `  2. Design — how to build it\n` +
+                `  3. Tasks — a step-by-step checklist\n` +
+                `Want changes? Just type them and Kiro rewrites the document. When it looks right, click "Save & Continue". ` +
+                `Files are saved to .kiro/specs/${this._specName}/.`,
         });
+        this._chatPanelProvider.postMessage({ type: 'systemMessage', message: STEP_LABEL.requirements });
 
         await this._sendPhasePrompt();
+    }
+
+    /** Resets the captured document; the reply to the next turn replaces it. */
+    beginTurn(): void {
+        // Keep the latest complete draft in case the next reply fails or is empty
+        if (this._currentPhase && this._currentPhaseBuffer.trim()) {
+            this._phaseContent.set(this._currentPhase, this._currentPhaseBuffer);
+        }
+        this._currentPhaseBuffer = '';
+    }
+
+    /**
+     * Wraps a message typed during a spec so the reply is a complete revised
+     * document for the current step (which then replaces the captured draft).
+     */
+    buildRevisionPrompt(userText: string): string {
+        if (!this._currentPhase) {
+            return userText;
+        }
+        const phase = this._currentPhase;
+        return [
+            userText,
+            '',
+            `(We are on the ${phase} step of the "${this._specName}" spec. Apply my feedback above and reply with the ` +
+            `complete updated ${phase} document only — no commentary before or after it.)`,
+            SAVE_NOTICE(this._specName, phase),
+        ].join('\n');
     }
 
     /**
@@ -157,7 +202,7 @@ export class SpecWorkflowManager {
         }
 
         // Capture current buffer
-        if (this._currentPhaseBuffer) {
+        if (this._currentPhaseBuffer.trim()) {
             this._phaseContent.set(this._currentPhase, this._currentPhaseBuffer);
         }
 
@@ -212,7 +257,7 @@ export class SpecWorkflowManager {
         }
 
         // Save current phase content
-        if (this._currentPhaseBuffer) {
+        if (this._currentPhaseBuffer.trim()) {
             this._phaseContent.set(this._currentPhase, this._currentPhaseBuffer);
         }
         this._currentPhaseBuffer = '';
@@ -222,12 +267,16 @@ export class SpecWorkflowManager {
         const nextIndex = currentIndex + 1;
 
         if (nextIndex < PHASE_ORDER.length) {
+            // "Save & Continue" really saves: write this step's file now, so
+            // nothing is lost if the user cancels a later step.
+            const saved = await this._writePhaseFile(this._currentPhase);
+
             this._currentPhase = PHASE_ORDER[nextIndex];
             this._notifyPhaseBar();
 
             this._chatPanelProvider.postMessage({
                 type: 'systemMessage',
-                message: `Phase: ${this._currentPhase}`,
+                message: (saved ? `💾 Saved ${saved}\n` : '') + STEP_LABEL[this._currentPhase],
             });
 
             await this._sendPhasePrompt();
@@ -279,7 +328,8 @@ export class SpecWorkflowManager {
         if (savedFiles.length > 0) {
             this._chatPanelProvider.postMessage({
                 type: 'systemMessage',
-                message: `✅ Spec "${this._specName}" saved to .kiro/specs/${this._specName}/\n${savedFiles.map(f => `  📄 ${f}`).join('\n')}`,
+                message: `✅ Spec "${this._specName}" saved to .kiro/specs/${this._specName}/\n${savedFiles.map(f => `  📄 ${f}`).join('\n')}\n` +
+                    `Next: ask Kiro to "implement task 1 from the ${this._specName} spec". You'll find it under Specs in the Kiro sidebar.`,
             });
 
             // Open the first file for the user
@@ -463,6 +513,23 @@ export class SpecWorkflowManager {
                     notice,
                 ].join('\n');
         }
+    }
+
+    /**
+     * Writes one phase's captured document to .kiro/specs/<name>/.
+     * Returns the workspace-relative path, or null if there was nothing to save.
+     */
+    private async _writePhaseFile(phase: SpecPhase): Promise<string | null> {
+        const content = this._phaseContent.get(phase);
+        const root = this._specRoot();
+        if (!content || !root) {
+            return null;
+        }
+        const specDir = vscode.Uri.joinPath(root, '.kiro', 'specs', this._specName);
+        await vscode.workspace.fs.createDirectory(specDir);
+        const fileUri = vscode.Uri.joinPath(specDir, PHASE_FILES[phase]);
+        await vscode.workspace.fs.writeFile(fileUri, Buffer.from(content, 'utf-8'));
+        return vscode.workspace.asRelativePath(fileUri);
     }
 
     /**

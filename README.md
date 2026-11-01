@@ -18,14 +18,28 @@ The extension finds `kiro-cli` on its own. If it can't, set `kiro.cliPath` to th
 - **Models and agents** come straight from your `kiro-cli`, so new models appear without an extension update.
 - **Slash commands** like `/context`, `/plan` and `/agent` are passed to the CLI exactly as typed.
 - **Working directory** shown under the header. Click it to change where `kiro-cli` runs; multi-root workspaces ask once.
-- **Spec workflow:** requirements → design → tasks, saved to `.kiro/specs/`.
+- **Plan a Feature (Spec):** before writing code, Kiro drafts the requirements (what), a design (how) and a task list (steps). You review each one, type changes if needed, then continue. Saved to `.kiro/specs/<name>/`, then ask: *"implement task 1 from the &lt;name&gt; spec"*.
+- **What Kiro Uses** sidebar: see your rules, specs, custom agents, skills and MCP servers, for the project and globally.
+
+## Rules
+
+Rules are Markdown files in `.kiro/steering/` (project) or `~/.kiro/steering/` (all projects) that tell Kiro your conventions. Create one with **Kiro: New Rule** or the **+** in the sidebar. Each rule has one of three modes:
+
+| Mode | Applied |
+|---|---|
+| Always | to every message |
+| For matching files | when the active file matches a pattern, e.g. `**/*.test.ts` |
+| Only when I ask | when you type `#rule-name` in the chat |
+
+The chat shows which rules it attached to a message.
 
 ## Commands
 
 | Command | |
 |---|---|
 | Kiro: Open Chat | Open the chat panel |
-| Kiro: Start Spec | Start a spec workflow |
+| Kiro: Plan a Feature (Spec) | Plan a feature step by step before coding |
+| Kiro: New Rule | Create a rule (steering file) |
 | Kiro: Select Working Directory | Choose where `kiro-cli` runs |
 | Kiro: Restart CLI | Restart `kiro-cli` with a fresh session |
 | Kiro: Login / Set API Key / Clear API Key | Authenticate |

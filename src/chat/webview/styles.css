@@ -471,6 +471,13 @@ body {
     color: var(--vscode-badge-foreground, #ccc);
 }
 
+.spec-phase-hint {
+    margin: 4px 0 6px;
+    font-size: 11px;
+    line-height: 1.4;
+    color: var(--vscode-descriptionForeground, #999);
+}
+
 .spec-phase-description {
     font-size: 11px;
     color: var(--vscode-descriptionForeground, #999);

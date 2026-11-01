@@ -296,7 +296,7 @@
 
         var isLastPhase = phaseIndex === phases.length - 1;
 
-        // Build phase badges
+        // Build phase badges ("1 Requirements", "2 Design", "3 Tasks")
         var badgesHtml = '<div class="spec-phases-list">';
         for (var i = 0; i < phases.length; i++) {
             var badgeClass = 'spec-phase';
@@ -307,14 +307,17 @@
             } else {
                 badgeClass += ' future';
             }
-            badgesHtml += '<span class="' + badgeClass + '">' + escapeHtml(phases[i]) + '</span>';
+            var label = phases[i].charAt(0).toUpperCase() + phases[i].slice(1);
+            badgesHtml += '<span class="' + badgeClass + '">' + (i < phaseIndex ? '✓ ' : (i + 1) + ' ') + escapeHtml(label) + '</span>';
         }
-        badgesHtml += '<span class="spec-phase-description">Phase ' + (phaseIndex + 1) + ' of ' + phases.length + '</span>';
+        badgesHtml += '<span class="spec-phase-description">Step ' + (phaseIndex + 1) + ' of ' + phases.length + '</span>';
         badgesHtml += '</div>';
+        badgesHtml += '<div class="spec-phase-hint">Review the document above. Want changes? Type them below and Kiro rewrites it. ' +
+            (isLastPhase ? 'When it looks right, click Save &amp; Finish.' : 'When it looks right, click Save &amp; Continue.') + '</div>';
 
         // Build action buttons: Save | Save & Continue (or Save & Finish) | Cancel
         var actionsHtml = '<div class="spec-phase-actions">';
-        actionsHtml += '<button class="spec-save-only-btn" id="spec-save-only-btn">💾 Save</button>';
+        actionsHtml += '<button class="spec-save-only-btn" id="spec-save-only-btn" title="Save this document without moving on">💾 Save</button>';
         if (isLastPhase) {
             actionsHtml += '<button class="spec-accept-btn" id="spec-accept-btn">✅ Save &amp; Finish</button>';
         } else {

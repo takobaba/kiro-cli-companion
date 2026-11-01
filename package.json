@@ -42,7 +42,7 @@
             },
             {
                 "command": "kiro.startSpec",
-                "title": "Kiro: Start Spec"
+                "title": "Kiro: Plan a Feature (Spec)"
             },
             {
                 "command": "kiro.restartCli",
@@ -63,6 +63,21 @@
             {
                 "command": "kiro.clearApiKey",
                 "title": "Kiro: Clear API Key"
+            },
+            {
+                "command": "kiro.newRule",
+                "title": "Kiro: New Rule",
+                "icon": "$(add)"
+            },
+            {
+                "command": "kiro.openRulesFolder",
+                "title": "Kiro: Open Rules Folder",
+                "icon": "$(folder-opened)"
+            },
+            {
+                "command": "kiro.refreshOverview",
+                "title": "Kiro: Refresh",
+                "icon": "$(refresh)"
             }
         ],
         "configuration": {
@@ -86,12 +101,72 @@
             "activitybar": [
                 {
                     "id": "kiro",
-                    "title": "Kiro",
+                    "title": "Kiro CLI Chat",
                     "icon": "resources/activitybar.svg"
                 }
             ]
         },
+        "views": {
+            "kiro": [
+                {
+                    "id": "kiro.launcher",
+                    "name": "Kiro CLI Chat",
+                    "icon": "resources/activitybar.svg"
+                },
+                {
+                    "id": "kiro.overview",
+                    "name": "What Kiro Uses",
+                    "icon": "resources/activitybar.svg"
+                }
+            ]
+        },
+        "viewsWelcome": [
+            {
+                "view": "kiro.launcher",
+                "contents": "Chat with the Kiro CLI in a panel beside your code.\n[Open Chat](command:kiro.openChat)\nPlan a feature before coding: Kiro writes the requirements, a design and a task list, and you review each step.\n[Plan a Feature (Spec)](command:kiro.startSpec)\nRules tell Kiro your conventions (coding style, testing, …). See them under \"What Kiro Uses\" below.\n[New Rule](command:kiro.newRule)\n[Open Rules Folder](command:kiro.openRulesFolder)\nChoose the folder kiro-cli runs in, or restart it if it stops responding.\n[Select Working Directory](command:kiro.selectWorkingDirectory)\n[Restart CLI](command:kiro.restartCli)\nNot signed in? [Log in](command:kiro.login) or [use an API key](command:kiro.setApiKey)."
+            }
+        ],
         "menus": {
+            "view/title": [
+                {
+                    "command": "kiro.newRule",
+                    "when": "view == kiro.overview",
+                    "group": "navigation@1"
+                },
+                {
+                    "command": "kiro.openRulesFolder",
+                    "when": "view == kiro.overview",
+                    "group": "navigation@2"
+                },
+                {
+                    "command": "kiro.refreshOverview",
+                    "when": "view == kiro.overview",
+                    "group": "navigation@3"
+                }
+            ],
+            "view/item/context": [
+                {
+                    "command": "kiro.newRule",
+                    "when": "view == kiro.overview && viewItem == kiroGroup.rules",
+                    "group": "inline@1"
+                },
+                {
+                    "command": "kiro.openRulesFolder",
+                    "when": "view == kiro.overview && viewItem == kiroGroup.rules",
+                    "group": "inline@2"
+                },
+                {
+                    "command": "kiro.startSpec",
+                    "when": "view == kiro.overview && viewItem == kiroGroup.specs",
+                    "group": "inline"
+                }
+            ],
+            "commandPalette": [
+                {
+                    "command": "kiro.refreshOverview",
+                    "when": "false"
+                }
+            ],
             "editor/title": [
                 {
                     "command": "kiro.openChat",

@@ -14,6 +14,7 @@ import { ChatPanelProvider } from './chat/chatPanelProvider';
 import { SpecWorkflowManager } from './spec/specWorkflowManager';
 import { CommandRegistry } from './commands/commandRegistry';
 import { StatusManager } from './status/statusManager';
+import { KiroOverviewProvider } from './overview/overviewView';
 
 /** SecretStorage key for the Kiro API key (passed to kiro-cli as KIRO_API_KEY). */
 const API_KEY_SECRET = 'kiro.apiKey';
@@ -75,6 +76,23 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         () => specWorkflowManager.saveCurrentPhase(),
         () => specWorkflowManager.cancelWorkflow()
     );
+    // Messages typed during a spec revise the current document
+    chatPanelProvider.setSpecSession(
+        () => specWorkflowManager.isActive,
+        (text) => specWorkflowManager.buildRevisionPrompt(text),
+        () => specWorkflowManager.beginTurn()
+    );
+
+    // "Kiro" sidebar overview: rules, specs, agents, skills, MCP servers
+    const overview = new KiroOverviewProvider(manager);
+    chatPanelProvider.setRulesSource(() => overview.getConfig().rules);
+    context.subscriptions.push(
+        overview,
+        vscode.window.registerTreeDataProvider('kiro.overview', overview),
+        vscode.commands.registerCommand('kiro.newRule', () => overview.createRule()),
+        vscode.commands.registerCommand('kiro.openRulesFolder', () => overview.openRulesFolder()),
+        vscode.commands.registerCommand('kiro.refreshOverview', () => overview.refresh())
+    );
 
     // 7. Create CommandRegistry and register commands
     const commandRegistry = new CommandRegistry(manager, chatPanelProvider, specWorkflowManager);
@@ -119,6 +137,16 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
     // 9. Create StatusManager
     const statusManager = new StatusManager(manager);
+
+    // Activity bar launcher. The view is intentionally empty so VS Code shows
+    // its welcome content (buttons defined in package.json "viewsWelcome").
+    // The chat itself still opens in an editor panel beside the code.
+    context.subscriptions.push(
+        vscode.window.registerTreeDataProvider<vscode.TreeItem>('kiro.launcher', {
+            getTreeItem: (item) => item,
+            getChildren: () => [],
+        })
+    );
 
     // 10. Push all disposables to context.subscriptions
     context.subscriptions.push(manager);
