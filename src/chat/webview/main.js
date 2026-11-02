@@ -4,6 +4,8 @@
  * Handles message exchange with the extension host via postMessage,
  * renders markdown content with syntax-highlighted code blocks and copy buttons,
  * manages model selection, tool status display, system messages, and chat UI state.
+ *
+ * Requirements: 4.2–4.8, 11.1, 12.1–12.5
  */
 
 (function () {
@@ -92,6 +94,9 @@
             case 'loading':
                 handleLoading(msg.active);
                 break;
+            case 'specPhase':
+                handleSpecPhase(msg.phase, msg.phaseIndex);
+                break;
             case 'specPhaseBar':
                 handleSpecPhaseBar(msg.phase, msg.phaseIndex, msg.phases);
                 break;
@@ -165,7 +170,7 @@
         currentAssistantMsg.innerHTML = renderMarkdown(streamBuffer);
 
         if (done) {
-            // Add copy buttons to code blocks
+            // Add copy buttons to code blocks (Requirement 4.4)
             addCopyButtons(currentAssistantMsg);
             currentAssistantMsg = null;
             streamBuffer = '';
@@ -177,6 +182,7 @@
     /**
      * Handles a tool status update from the extension host.
      * Shows tool activity as a separate compact element between text chunks.
+     * Requirement 4.6
      * @param {string} title
      * @param {string} status
      * @param {string} kind
@@ -206,6 +212,7 @@
 
     /**
      * Displays an error message with a red label and retry button.
+     * Requirement 11.1
      * @param {string} message
      */
     function handleError(message) {
@@ -233,6 +240,7 @@
 
     /**
      * Shows or hides the animated loading indicator.
+     * Requirement 4.5
      * @param {boolean} active
      */
     function handleLoading(active) {
@@ -244,6 +252,25 @@
             }
         }
         scrollToBottom();
+    }
+
+    /**
+     * Displays the spec phase indicator bar (legacy simple version).
+     * @param {string} phase
+     * @param {number} phaseIndex
+     */
+    function handleSpecPhase(phase, phaseIndex) {
+        if (!specPhaseBar) {
+            return;
+        }
+        var phases = ['requirements', 'design', 'tasks'];
+        specPhaseBar.classList.remove('hidden');
+        specPhaseBar.innerHTML = phases
+            .map(function (p, i) {
+                var cls = 'spec-phase' + (i === phaseIndex ? ' active' : '');
+                return '<span class="' + cls + '">' + escapeHtml(p) + '</span>';
+            })
+            .join('');
     }
 
     /**
@@ -325,6 +352,7 @@
 
     /**
      * Displays a system message with muted styling.
+     * Requirement 4.7
      * @param {string} message
      */
     function handleSystemMessage(message) {
@@ -337,6 +365,7 @@
 
     /**
      * Updates the model and agent selectors from config options.
+     * Requirement 12.1, 12.4
      * @param {Array} options
      */
     function handleConfigOptions(options) {
@@ -485,6 +514,7 @@
 
     /**
      * Adds copy-to-clipboard buttons to all code blocks in a message element.
+     * Requirement 4.4
      * @param {HTMLElement} messageEl
      */
     function addCopyButtons(messageEl) {

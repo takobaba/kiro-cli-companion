@@ -4,17 +4,19 @@
  * Creates and manages a vscode.WebviewPanel with retainContextWhenHidden,
  * handles incoming messages from the Webview, sends ACP streaming requests
  * through the CLI, and forwards responses/errors back to the Webview.
+ *
+ * Requirements: 4.1–4.8, 11.1–11.4, 12.1–12.5, 13.1
  */
 
 import * as vscode from 'vscode';
 import * as path from 'path';
 import * as fs from 'fs';
 import { execFile } from 'child_process';
-import { randomBytes } from 'crypto';
 import { cliSpawnTarget } from '../cli/cliLocator';
 import { CliManager } from '../cli/cliManager';
 import { CliProcess, MODE_CONFIG_ID } from '../cli/cliProcess';
 import { AppliedRule, Rule, formatRulesBlock, rulesToAttach } from '../rules/rules';
+import { WorkspaceContextProvider } from '../context/workspaceContextProvider';
 import type { ExtToWebviewMessage, WebviewToExtMessage, ContextUsage } from '../types';
 
 const VIEW_TYPE = 'kiro.chatPanel';
@@ -53,7 +55,8 @@ export class ChatPanelProvider implements vscode.Disposable {
 
     constructor(
         private readonly _extensionUri: vscode.Uri,
-        private readonly _cliManager: CliManager
+        private readonly _cliManager: CliManager,
+        _contextProvider: WorkspaceContextProvider
     ) {
         // Seed with the current active editor
         this._lastActiveTextEditor = vscode.window.activeTextEditor;
@@ -188,7 +191,6 @@ export class ChatPanelProvider implements vscode.Disposable {
             return;
         }
 
-        const groupsBefore = vscode.window.tabGroups.all.length;
         this._panel = vscode.window.createWebviewPanel(
             VIEW_TYPE,
             'Kiro Chat',
@@ -202,16 +204,13 @@ export class ChatPanelProvider implements vscode.Disposable {
 
         this._panel.webview.html = this._getWebviewContent();
 
-        // Make the chat a narrow (1/4) column on the right — but only when the
-        // user had a single editor group, so their own splits/sizes are kept.
-        if (groupsBefore === 1) {
-            setTimeout(() => {
-                vscode.commands.executeCommand('vscode.setEditorLayout', {
-                    orientation: 0,
-                    groups: [{ size: 0.75 }, { size: 0.25 }],
-                });
-            }, 100);
-        }
+        // Set editor layout to make the panel 1/4 width after the panel is created
+        setTimeout(() => {
+            vscode.commands.executeCommand('vscode.setEditorLayout', {
+                orientation: 0,
+                groups: [{ size: 0.75 }, { size: 0.25 }]
+            });
+        }, 100);
 
         // Prevent files from opening in the chat panel's column.
         this._panel.onDidChangeViewState(
@@ -270,17 +269,18 @@ export class ChatPanelProvider implements vscode.Disposable {
 
         try {
             const cliProcess = await this._cliManager.ensureProcess();
-            // Log size only — prompts can contain file contents
-            _log.appendLine(`[Chat] Sending prompt (${promptText.length} chars)`);
+            _log.appendLine(`[Chat] Sending prompt: "${promptText.substring(0, 120)}"`);
             this._attachProcess(cliProcess);
 
             // Use the ACP session/prompt flow with session/update notifications
             await cliProcess.sendPrompt(promptText, (update) => {
                 const sessionUpdate = update.sessionUpdate as string;
+                _log.appendLine(`[Chat] Got update: ${sessionUpdate}`);
 
                 if (sessionUpdate === 'agent_message_chunk') {
                     const content = update.content as { type: string; text?: string } | undefined;
                     if (content?.text) {
+                        _log.appendLine(`[Chat] Chunk: "${content.text.substring(0, 50)}"`);
                         this._postMessage({ type: 'response', content: content.text, done: false });
 
                         // Capture content for spec workflow if active
@@ -296,6 +296,8 @@ export class ChatPanelProvider implements vscode.Disposable {
                         _log.appendLine(`[Chat] Tool: ${title} [${status || ''}]`);
                         this._postMessage({ type: 'toolStatus', title, status: status || '', kind: kind || '' });
                     }
+                } else if (sessionUpdate === 'config_options_update') {
+                    this._parseAndSendConfigOptions(update);
                 } else if (sessionUpdate === 'context_usage') {
                     this._handleContextUsageUpdate(update);
                 }
@@ -304,6 +306,9 @@ export class ChatPanelProvider implements vscode.Disposable {
             _log.appendLine(`[Chat] Prompt completed`);
             this._postMessage({ type: 'response', content: '', done: true });
             this._lastFailedMessage = null;
+
+            // Refresh workspace files to detect changes made by the CLI (Requirement 13.1)
+            this._refreshWorkspaceFiles();
         } catch (err) {
             const rawMessage = err instanceof Error ? err.message : 'An unknown error occurred';
             const errorCode = (err as { code?: number } | undefined)?.code;
@@ -405,8 +410,21 @@ export class ChatPanelProvider implements vscode.Disposable {
      * Ensures the panel is open and ready before sending.
      */
     async handleSpecPrompt(prompt: string, phaseLabel: string): Promise<void> {
-        // openPanel() creates the panel synchronously, so it exists right after
+        // Ensure panel is open
         this.openPanel();
+
+        // Wait for panel to be ready
+        let retries = 10;
+        while (!this._panel && retries > 0) {
+            await new Promise<void>((r) => setTimeout(r, 100));
+            retries--;
+        }
+
+        if (!this._panel) {
+            vscode.window.showErrorMessage('Failed to open Kiro Chat panel.');
+            return;
+        }
+
         this._postMessage({ type: 'systemMessage', message: `Generating ${phaseLabel}...` });
         await this._sendPromptInternal(prompt, true);
     }
@@ -477,13 +495,13 @@ export class ChatPanelProvider implements vscode.Disposable {
                 this.handleUserMessage(message.text);
                 break;
             case 'retry':
-                // Re-send the last failed message if available
+                // Re-send the last failed message if available (Requirement 11.3)
                 if (this._lastFailedMessage !== null) {
                     this.handleUserMessage(this._lastFailedMessage);
                 }
                 break;
             case 'selectModel':
-                // Handle model selection from the webview
+                // Handle model selection from the webview (Requirement 12.2)
                 this._handleModelSelection(message.configId, message.value);
                 break;
             case 'specAccept':
@@ -510,6 +528,10 @@ export class ChatPanelProvider implements vscode.Disposable {
             case 'changeWorkingDirectory':
                 vscode.commands.executeCommand('kiro.selectWorkingDirectory');
                 break;
+            case 'selectFiles':
+            case 'advanceSpec':
+                // Handled by other components (SpecWorkflowManager)
+                break;
         }
     }
 
@@ -520,6 +542,7 @@ export class ChatPanelProvider implements vscode.Disposable {
     private _handleMetadataNotification(metadata: Record<string, unknown>): void {
         const contextUsagePercentage = metadata.contextUsagePercentage as number | undefined;
         if (contextUsagePercentage !== undefined) {
+            _log.appendLine(`[Chat] Metadata: contextUsagePercentage=${contextUsagePercentage}`);
             this._contextUsage = {
                 ...this._contextUsage,
                 total: contextUsagePercentage,
@@ -544,6 +567,8 @@ export class ChatPanelProvider implements vscode.Disposable {
     /**
      * Handles model selection from the webview.
      * Tries ACP protocol first, falls back to kiro-cli settings command.
+     *
+     * Requirement 12.2, 12.3
      */
     private async _handleModelSelection(configId: string, value: string): Promise<void> {
         try {
@@ -563,7 +588,7 @@ export class ChatPanelProvider implements vscode.Disposable {
                 }
             }
 
-            // Fallback for models only: change the CLI's default model
+            // Fallback for models only: change the CLI's default model (Requirement 12.3)
             const cliPath = this._cliManager.resolvedCliPath;
             if (cliPath) {
                 await this._setModelViaCli(cliPath, value);
@@ -591,6 +616,56 @@ export class ChatPanelProvider implements vscode.Disposable {
                 resolve();
             });
         });
+    }
+
+    /**
+     * Parses config options from a session/update notification and sends them to the webview.
+     *
+     * Requirement 12.4
+     */
+    private _parseAndSendConfigOptions(update: Record<string, unknown>): void {
+        try {
+            const configOptions = update.configOptions as Array<Record<string, unknown>> | undefined;
+            if (!configOptions || !Array.isArray(configOptions)) {
+                return;
+            }
+
+            const options = configOptions.map((o) => {
+                const opts = (o.options as Array<Record<string, unknown>> || []).map((opt) => ({
+                    value: (opt.value as string) || '',
+                    name: (opt.name as string) || (opt.value as string) || '',
+                    description: (opt.description as string) || '',
+                }));
+                return {
+                    id: (o.id as string) || '',
+                    name: (o.name as string) || (o.id as string) || '',
+                    description: (o.description as string) || '',
+                    category: (o.category as string) || '',
+                    currentValue: (o.currentValue as string) || '',
+                    options: opts,
+                };
+            });
+
+            if (options.length > 0) {
+                this._postMessage({ type: 'configOptions', options });
+            }
+        } catch (err) {
+            _log.appendLine(`[Chat] Failed to parse config_options_update: ${err}`);
+        }
+    }
+
+    /**
+     * Refreshes workspace files to detect changes made by the CLI agent.
+     *
+     * Requirement 13.1
+     */
+    private _refreshWorkspaceFiles(): void {
+        // Watch the directory the CLI actually works in (may differ from folders[0])
+        const cwd = this._cliManager.currentWorkingDirectory;
+        const pattern = new vscode.RelativePattern(vscode.Uri.file(cwd), '**/*');
+        const watcher = vscode.workspace.createFileSystemWatcher(pattern);
+        // Dispose shortly after — the creation itself triggers a scan
+        setTimeout(() => watcher.dispose(), 1000);
     }
 
     /**
@@ -636,9 +711,14 @@ export class ChatPanelProvider implements vscode.Disposable {
     }
 
     /**
-     * Generates a cryptographically random nonce for the Content Security Policy.
+     * Generates a random nonce for the Content Security Policy.
      */
     private _getNonce(): string {
-        return randomBytes(16).toString('base64');
+        const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+        let nonce = '';
+        for (let i = 0; i < 32; i++) {
+            nonce += chars.charAt(Math.floor(Math.random() * chars.length));
+        }
+        return nonce;
     }
 }

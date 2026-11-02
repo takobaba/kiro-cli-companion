@@ -7,7 +7,7 @@ A companion for the [Kiro CLI](https://kiro.dev) inside VS Code: chat beside you
 ## Getting started
 
 1. Install `kiro-cli` and run `kiro-cli login`, or use **Kiro: Set API Key** if you'd rather not log in through a browser.
-2. Click the `>_` **Kiro CLI Companion** icon in the activity bar, or run **Kiro: Open Chat** from the Command Palette.
+2. Run **Kiro: Open Chat** from the Command Palette.
 
 The extension finds `kiro-cli` on its own. If it can't, set `kiro.cliPath` to the full path of the executable.
 
@@ -39,7 +39,7 @@ The chat shows which rules it attached to a message.
 |---|---|
 | Kiro: Open Chat | Open the chat panel |
 | Kiro: Plan a Feature (Spec) | Plan a feature step by step before coding |
-| Kiro: New Rule / Open Rules Folder | Create a rule, or open the rules folder |
+| Kiro: New Rule | Create a rule (steering file) |
 | Kiro: Select Working Directory | Choose where `kiro-cli` runs |
 | Kiro: Restart CLI | Restart `kiro-cli` with a fresh session |
 | Kiro: Login / Set API Key / Clear API Key | Authenticate |
@@ -59,4 +59,4 @@ The chat shows which rules it attached to a message.
 
 ## License
 
-[MIT](LICENSE)
+[MIT](LICENSE.md)

@@ -2,8 +2,8 @@
     "name": "kiro-cli-companion",
     "displayName": "Kiro CLI Companion",
     "description": "Unofficial companion for the Kiro CLI: chat beside your code, plan features with specs, manage rules, and see what Kiro uses. Requires kiro-cli from kiro.dev.",
-    "version": "0.1.0",
-    "publisher": "Takobaba",
+    "version": "0.0.1",
+    "publisher": "takobaba",
     "author": "Takobaba",
     "license": "MIT",
     "repository": {
@@ -28,8 +28,7 @@
         "kiro",
         "agent",
         "chat",
-        "kiro-cli",
-        "steering",
+        "copilot",
         "code generation",
         "spec workflow"
     ],
@@ -204,5 +203,8 @@
         "typescript": "^5.8.3",
         "webpack": "^5.99.5",
         "webpack-cli": "^5.1.4"
+    },
+    "dependencies": {
+        "ignore": "^7.0.5"
     }
 }
