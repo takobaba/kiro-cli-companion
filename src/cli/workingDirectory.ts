@@ -1,5 +1,5 @@
 /**
- * Resolves the directory kiro-cli is started in (its cwd and ACP session cwd).
+ * Resolves the directory kiro-cli is started in (the Kiro terminal's cwd).
  *
  * Always using the first workspace folder is wrong for multi-root workspaces
  * where the folders are e.g. submodules of a monorepo. Resolution order:

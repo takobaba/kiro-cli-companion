@@ -1,8 +1,8 @@
 {
     "name": "kiro-cli-companion",
     "displayName": "Kiro CLI Companion",
-    "description": "Unofficial companion for the Kiro CLI: chat beside your code, plan features with specs, manage rules, and see what Kiro uses. Requires kiro-cli from kiro.dev.",
-    "version": "0.0.2",
+    "description": "Unofficial companion for the Kiro CLI: manage the rules, specs, permissions, agents, skills and MCP servers Kiro uses from the sidebar, and chat with kiro-cli in a terminal beside your code. Requires kiro-cli from kiro.dev.",
+    "version": "0.1.0",
     "publisher": "takobaba",
     "author": "Takobaba",
     "license": "MIT",
@@ -94,6 +94,15 @@
                     "scope": "machine",
                     "markdownDescription": "Full path to the `kiro-cli` executable (or the directory containing it). Leave empty to auto-detect from `KIRO_CLI_PATH`, `PATH`, the Windows user/system PATH, and common install locations such as `%LOCALAPPDATA%\\Kiro-Cli\\kiro-cli.exe` or `~/.local/bin/kiro-cli`."
                 },
+                "kiro.chatArguments": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    },
+                    "default": [],
+                    "scope": "machine",
+                    "markdownDescription": "Extra arguments for `kiro-cli chat` when the Kiro terminal starts, e.g. `[\"--v3\"]`, `[\"--agent\", \"my-agent\"]` or `[\"--model\", \"<model>\"]`. Run `kiro-cli chat --help` for the full list. User settings only: a workspace can't set this."
+                },
                 "kiro.workingDirectory": {
                     "type": "string",
                     "default": "",
@@ -128,7 +137,7 @@
         "viewsWelcome": [
             {
                 "view": "kiro.launcher",
-                "contents": "[Open Chat](command:kiro.openChat)\nPlan before you develop!\n[Spec](command:kiro.startSpec)\nRules tell Kiro how to work and develop.\n[New Rule](command:kiro.newRule)\nSet it once!\n[Select Working Directory](command:kiro.selectWorkingDirectory)\n[Restart CLI](command:kiro.restartCli)\nNot signed in? [Log in](command:kiro.login) or [use an API key](command:kiro.setApiKey)."
+                "contents": "Opens kiro-cli in a terminal beside your code.\n[Open Chat](command:kiro.openChat)\nPlan before you develop!\n[Spec](command:kiro.startSpec)\nRules tell Kiro how to work and develop.\n[New Rule](command:kiro.newRule)\nSet it once!\n[Select Working Directory](command:kiro.selectWorkingDirectory)\n[Restart CLI](command:kiro.restartCli)\nNot signed in? [Log in](command:kiro.login) or [use an API key](command:kiro.setApiKey)."
             }
         ],
         "menus": {
@@ -205,7 +214,6 @@
         "@typescript-eslint/parser": "^8.31.0",
         "@vscode/test-cli": "^0.0.10",
         "@vscode/test-electron": "^2.5.2",
-        "copy-webpack-plugin": "^12.0.2",
         "eslint": "^9.25.0",
         "fast-check": "^3.23.2",
         "sinon": "^19.0.2",

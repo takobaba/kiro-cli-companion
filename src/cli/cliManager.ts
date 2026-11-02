@@ -1,15 +1,13 @@
 /**
- * CliManager manages CLI discovery, authentication verification, login,
- * and process lifecycle. It provides a single CLI process per workspace
- * with lazy spawning, started in a user-selectable working directory.
+ * CliManager handles CLI discovery, authentication checks, login, the
+ * directory kiro-cli starts in, and the environment it starts with.
+ * The chat itself runs in a terminal (see terminal/kiroTerminal.ts).
  */
 
 import * as vscode from 'vscode';
 import { execFile } from 'child_process';
 import * as pathModule from 'path';
-import * as fs from 'fs';
-import { CliProcess } from './cliProcess';
-import { CliState, SessionInfo } from '../types';
+import { CliState } from '../types';
 import { cliSpawnTarget, getHomeDir, isExecutableFile, locateCli } from './cliLocator';
 import {
     ResolvedWorkingDirectory,
@@ -39,32 +37,20 @@ export interface CliManagerOptions {
 export class CliManager implements vscode.Disposable {
     private _state: CliState = { status: 'not_found' };
     private _resolvedCliPath: string | null = null;
-    private _cliSource: string | null = null;
-    private _process: CliProcess | null = null;
     private readonly _options: CliManagerOptions;
-    private _isReconnecting = false;
-    /** Working directory of the running process (or the last one chosen). */
-    private _workingDirectory: ResolvedWorkingDirectory | null = null;
     /** De-duplicates concurrent multi-root pickers. */
     private _pendingPick: Promise<ResolvedWorkingDirectory> | null = null;
-    /** De-duplicates concurrent spawns (panel open + first message). */
-    private _pendingSpawn: Promise<CliProcess> | null = null;
     /** Kiro API key (from SecretStorage), passed as KIRO_API_KEY. */
     private _apiKey: string | undefined;
 
-    /** Callback to post system messages during reconnect. */
-    private _onSystemMessage: ((message: string) => void) | null = null;
-    /** Callback to post error messages during reconnect. */
-    private _onErrorMessage: ((message: string) => void) | null = null;
-
     private readonly _onDidChangeState = new vscode.EventEmitter<CliState>();
+    /** Fires on CLI state changes and when the working directory changes. */
     public readonly onDidChangeState: vscode.Event<CliState> = this._onDidChangeState.event;
 
     constructor(options?: CliManagerOptions) {
         this._options = options ?? {};
     }
 
-    /** Returns the current CLI state. */
     get state(): CliState {
         return this._state;
     }
@@ -74,30 +60,9 @@ export class CliManager implements vscode.Disposable {
         return this._resolvedCliPath;
     }
 
-    /**
-     * Best-known working directory without prompting: the running process's
-     * cwd, else the last chosen one, else the non-interactive default.
-     */
+    /** The directory kiro-cli starts in, resolved without prompting. */
     get currentWorkingDirectory(): string {
-        if (this._workingDirectory) {
-            return this._workingDirectory.path;
-        }
         return resolveWorkingDirectoryNonInteractive(this._options.workspaceState).path;
-    }
-
-    /** Snapshot of where/how kiro-cli is (or will be) running, for the UI. */
-    getSessionInfo(): SessionInfo {
-        const wd = this._workingDirectory ?? resolveWorkingDirectoryNonInteractive(this._options.workspaceState);
-        const running = !!this._process && this._process.isAlive && this._state.status === 'running';
-        return {
-            cwd: wd.path,
-            cwdSource: wd.source,
-            cliPath: this._resolvedCliPath,
-            cliSource: this._cliSource,
-            running,
-            sessionId: running ? this._process!.sessionId : null,
-            multiRoot: (vscode.workspace.workspaceFolders?.length ?? 0) > 1,
-        };
     }
 
     /**
@@ -114,6 +79,7 @@ export class CliManager implements vscode.Disposable {
                 const picked = await pickWorkingDirectory(resolved.path);
                 if (picked) {
                     await this._options.workspaceState?.update(WORKING_DIRECTORY_STATE_KEY, picked);
+                    this._setState(this._state);
                     return { path: picked, source: 'picked' as const };
                 }
                 // Dismissed: use the default for now, ask again next time
@@ -126,13 +92,11 @@ export class CliManager implements vscode.Disposable {
     }
 
     /**
-     * Lets the user pick a new working directory. If it differs from the
-     * running process's cwd, the CLI is restarted there.
-     * Returns the new directory, or undefined if cancelled/unchanged.
+     * Lets the user pick a new working directory for future kiro-cli sessions.
+     * Returns the effective directory, or undefined if cancelled.
      */
     async selectWorkingDirectory(): Promise<string | undefined> {
-        const current = this.currentWorkingDirectory;
-        const picked = await pickWorkingDirectory(current);
+        const picked = await pickWorkingDirectory(this.currentWorkingDirectory);
         if (!picked) {
             return undefined;
         }
@@ -145,18 +109,9 @@ export class CliManager implements vscode.Disposable {
                 'Clear the setting to use the picked directory.'
             );
         }
-
-        const next = resolveWorkingDirectoryNonInteractive(this._options.workspaceState);
-        const sameDir = this._samePath(next.path, this._workingDirectory?.path);
-        this._workingDirectory = next;
-
-        if (this._process && this._process.isAlive && !sameDir) {
-            await this.restartProcess();
-        } else {
-            // Not running: just notify listeners so the UI updates
-            this._setState(this._state);
-        }
-        return next.path;
+        // Lets the overview follow the new directory
+        this._setState(this._state);
+        return this.currentWorkingDirectory;
     }
 
     /**
@@ -167,81 +122,52 @@ export class CliManager implements vscode.Disposable {
         this._apiKey = apiKey?.trim() || undefined;
     }
 
-    /** Environment for kiro-cli child processes. */
+    /** Extra environment for kiro-cli terminals (merged into VS Code's own). */
+    terminalEnv(): Record<string, string> {
+        return this._apiKey ? { KIRO_API_KEY: this._apiKey } : {};
+    }
+
+    /** Environment for kiro-cli child processes (whoami, login). */
     private _childEnv(): NodeJS.ProcessEnv {
-        if (!this._apiKey) {
-            return process.env;
-        }
-        return { ...process.env, KIRO_API_KEY: this._apiKey };
-    }
-
-    /**
-     * Starts a fresh ACP session (clears conversation and slash-command state
-     * such as /plan) on the running process, or spawns one if none is alive.
-     */
-    async newSession(): Promise<CliProcess> {
-        if (this._process && this._process.isAlive && this._state.status === 'running') {
-            const proc = this._process;
-            await proc.createSession(proc.cwd);
-            this._setState({ status: 'running', cliPath: proc.cliPath, process: proc, cwd: proc.cwd });
-            return proc;
-        }
-        return this.ensureProcess();
-    }
-
-    /**
-     * Sets callbacks for system/error messages during auto-reconnect.
-     */
-    setMessageCallbacks(
-        onSystem: (message: string) => void,
-        onError: (message: string) => void
-    ): void {
-        this._onSystemMessage = onSystem;
-        this._onErrorMessage = onError;
+        return { ...process.env, ...this.terminalEnv() };
     }
 
     /**
      * Resolves the CLI binary path. See `locateCli` for the search order
      * (setting → KIRO_CLI_PATH → PATH → Windows registry PATH → known
-     * install locations). On Unix, falls back to sourcing shell profiles
-     * (~/.zshrc, ~/.bashrc, ~/.bash_profile, ~/.profile).
+     * install locations). On Unix, falls back to asking the login shell.
      *
      * Returns null if the binary is not found.
      */
     async resolveCliPath(): Promise<string | null> {
         if (this._options.cliPath) {
-            this._resolvedCliPath = this._options.cliPath;
-            this._cliSource = 'override';
-            this._setState({ status: 'ready', cliPath: this._resolvedCliPath });
-            return this._resolvedCliPath;
+            return this._setResolved(this._options.cliPath);
         }
 
         const configuredPath = vscode.workspace.getConfiguration('kiro').get<string>('cliPath', '');
         const located = await locateCli({ configuredPath, log: (m) => _log.appendLine(m) });
         if (located) {
             _log.appendLine(`[CliManager] Found kiro-cli at ${located.path} (via ${located.source})`);
-            return this._setResolved(located.path, located.source);
+            return this._setResolved(located.path);
         }
 
-        // On Unix, try sourcing shell profiles to get the full PATH
+        // On Unix, try the login shell to get the full PATH
         if (process.platform !== 'win32') {
             const profilePath = await this._findViaShellProfile('kiro-cli');
             if (profilePath) {
                 _log.appendLine(`[CliManager] Found kiro-cli at ${profilePath} (via shell profile)`);
-                return this._setResolved(profilePath, 'shell profile');
+                return this._setResolved(profilePath);
             }
         }
 
         _log.appendLine('[CliManager] kiro-cli not found (checked kiro.cliPath, KIRO_CLI_PATH, PATH, known install locations).');
         this._resolvedCliPath = null;
-        this._cliSource = null;
         this._setState({ status: 'not_found' });
         return null;
     }
 
-    private _setResolved(cliPath: string, source: string): string {
+    private _setResolved(cliPath: string): string {
         this._resolvedCliPath = cliPath;
-        this._cliSource = source;
         this._setState({ status: 'ready', cliPath });
         return cliPath;
     }
@@ -259,10 +185,7 @@ export class CliManager implements vscode.Disposable {
                     this._setState({ status: 'not_authenticated' });
                     resolve(false);
                 } else {
-                    // Restore ready state with the CLI path
-                    if (this._state.status !== 'running') {
-                        this._setState({ status: 'ready', cliPath });
-                    }
+                    this._setState({ status: 'ready', cliPath });
                     resolve(true);
                 }
             });
@@ -294,199 +217,26 @@ export class CliManager implements vscode.Disposable {
             }
 
             const target = cliSpawnTarget(cliPath);
-            execFile(target.command, ['login'], { timeout: 120000, env, shell: target.shell, windowsHide: true }, (error, _stdout, _stderr) => {
+            execFile(target.command, ['login'], { timeout: 120000, env, shell: target.shell, windowsHide: true }, (error) => {
                 if (!error) {
                     this._setState({ status: 'ready', cliPath });
                     resolve(true);
-                } else {
-                    // Check if already authenticated despite login exit code
-                    this.checkAuthentication(cliPath).then((isAuth) => {
-                        if (isAuth) {
-                            this._setState({ status: 'ready', cliPath });
-                            resolve(true);
-                        } else {
-                            resolve(false);
-                        }
-                    });
+                    return;
                 }
+                // Check if already authenticated despite login exit code
+                this.checkAuthentication(cliPath).then(resolve);
             });
         });
     }
 
-    /**
-     * Spawns a CLI process if one isn't already alive. Reuses the existing
-     * process if it's still running (lazy spawning).
-     */
-    async ensureProcess(options: { interactive?: boolean } = {}): Promise<CliProcess> {
-        // A spawn is already in flight (e.g. panel open + first message) — share it
-        if (this._pendingSpawn) {
-            return this._pendingSpawn;
-        }
-        // Reuse existing process if alive and its session is ready
-        if (this._process && this._process.isAlive && this._process.sessionId) {
-            return this._process;
-        }
-        this._pendingSpawn = this._spawnProcess(options).finally(() => {
-            this._pendingSpawn = null;
-        });
-        return this._pendingSpawn;
-    }
-
-    private async _spawnProcess(options: { interactive?: boolean }): Promise<CliProcess> {
-        // Clean up dead / half-initialized process
-        if (this._process) {
-            const old = this._process;
-            this._process = null;
-            old.dispose();
-        }
-
-        // Determine CLI path, re-resolving if needed
-        let cliPath = this._resolvedCliPath;
-        if (!cliPath) {
-            cliPath = await this.resolveCliPath();
-            if (!cliPath) {
-                throw new Error(CLI_NOT_FOUND_MESSAGE);
-            }
-        }
-
-        // Re-use the directory the previous process ran in (e.g. on auto-reconnect),
-        // otherwise resolve it — which may ask the user in a multi-root workspace.
-        const workingDirectory = this._workingDirectory && fs.existsSync(this._workingDirectory.path)
-            ? this._workingDirectory
-            : await this.resolveWorkingDirectory(options.interactive ?? true);
-        this._workingDirectory = workingDirectory;
-        const workspacePath = workingDirectory.path;
-        _log.appendLine(`[CliManager] Starting kiro-cli in ${workspacePath} (${workingDirectory.source})`);
-
-        const cliProcess = new CliProcess(cliPath, workspacePath, this._childEnv());
-        this._process = cliProcess;
-
-        // Listen for unexpected exits
-        cliProcess.onDidExit((exitInfo) => {
-            if (this._process === cliProcess) {
-                this._process = null;
-                this._setState({ status: 'ready', cliPath: cliPath! });
-
-                // Attempt auto-reconnect on unexpected exits
-                const wasUnexpected = exitInfo.code !== 0 && exitInfo.code !== null;
-                if (wasUnexpected && !this._isReconnecting) {
-                    this._attemptAutoReconnect();
-                }
-            }
-        });
-
-        // Initialize ACP and create session; don't leave a half-started process around
-        try {
-            await cliProcess.initializeAndCreateSession(workspacePath);
-        } catch (err) {
-            if (this._process === cliProcess) {
-                this._process = null;
-            }
-            cliProcess.dispose();
-            throw err;
-        }
-
-        this._setState({ status: 'running', cliPath, process: cliProcess, cwd: workspacePath });
-        return cliProcess;
-    }
-
-    /**
-     * Terminates the current CLI process and spawns a new one.
-     */
-    async restartProcess(): Promise<CliProcess> {
-        if (this._process) {
-            const old = this._process;
-            this._process = null;
-            old.dispose();
-        }
-
-        // Re-resolve CLI path to handle environment changes
-        await this.resolveCliPath();
-
-        // Re-read the working directory in case the setting/choice changed
-        const next = resolveWorkingDirectoryNonInteractive(this._options.workspaceState);
-        if (!next.needsPick) {
-            this._workingDirectory = next;
-        }
-
-        return this.ensureProcess();
-    }
-
-    /**
-     * Gracefully terminates all CLI processes.
-     * Sends SIGTERM first, then SIGKILL after 5 seconds if still alive.
-     */
     dispose(): void {
-        if (this._process) {
-            const proc = this._process;
-            this._process = null;
-
-            // Send SIGTERM
-            proc.kill();
-
-            // Force kill after 5 seconds if still alive
-            const killTimeout = setTimeout(() => {
-                if (proc.isAlive) {
-                    try {
-                        proc.dispose();
-                    } catch {
-                        // Ignore errors during forced cleanup
-                    }
-                }
-            }, 5000);
-
-            // If the process exits before the timeout, clear it
-            proc.onDidExit(() => {
-                clearTimeout(killTimeout);
-            });
-        }
-
         this._onDidChangeState.dispose();
-    }
-
-    /**
-     * Attempts to auto-reconnect with exponential backoff after an unexpected exit.
-     * Makes 3 attempts with delays of 2s, 4s, 8s.
-     */
-    private async _attemptAutoReconnect(): Promise<void> {
-        const MAX_ATTEMPTS = 3;
-        const BASE_DELAY_MS = 2000;
-        this._isReconnecting = true;
-
-        for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-            const delay = BASE_DELAY_MS * Math.pow(2, attempt - 1); // 2s, 4s, 8s
-
-            this._onSystemMessage?.(
-                `CLI process exited unexpectedly. Reconnect attempt ${attempt}/${MAX_ATTEMPTS} in ${delay / 1000}s...`
-            );
-
-            await new Promise<void>((resolve) => setTimeout(resolve, delay));
-
-            try {
-                await this.ensureProcess({ interactive: false });
-                this._onSystemMessage?.('CLI reconnected successfully.');
-                this._isReconnecting = false;
-                return;
-            } catch (err) {
-                const msg = err instanceof Error ? err.message : 'Unknown error';
-                this._onSystemMessage?.(`Reconnect attempt ${attempt} failed: ${msg}`);
-            }
-        }
-
-        // All attempts failed
-        this._isReconnecting = false;
-        this._onErrorMessage?.(
-            'Failed to reconnect after 3 attempts. Use "Kiro: Restart CLI" from the Command Palette to reconnect manually.'
-        );
     }
 
     /**
      * Asks the user's login shell where the binary is, so PATH changes made in
      * ~/.zshrc, ~/.bashrc, ~/.profile etc. are honoured even when VS Code was
      * started from the Dock/launcher with a minimal environment.
-     *
-     * One interactive login shell (`-ilc`) loads the same profiles a terminal
-     * would, in a single call with a single timeout.
      */
     private async _findViaShellProfile(binary: string): Promise<string | null> {
         if (!/^[\w.-]+$/.test(binary)) {
@@ -506,18 +256,6 @@ export class CliManager implements vscode.Disposable {
         });
     }
 
-    private _samePath(a: string | undefined, b: string | undefined): boolean {
-        if (!a || !b) {
-            return false;
-        }
-        const ra = pathModule.resolve(a);
-        const rb = pathModule.resolve(b);
-        return process.platform === 'win32' ? ra.toLowerCase() === rb.toLowerCase() : ra === rb;
-    }
-
-    /**
-     * Updates the internal state and fires the state change event.
-     */
     private _setState(newState: CliState): void {
         this._state = newState;
         this._onDidChangeState.fire(newState);

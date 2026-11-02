@@ -7,8 +7,8 @@
 
 import * as vscode from 'vscode';
 import { CliManager, CLI_NOT_FOUND_MESSAGE } from './cli/cliManager';
-import { ChatPanelProvider } from './chat/chatPanelProvider';
 import { SpecWorkflowManager } from './spec/specWorkflowManager';
+import { KiroTerminalManager } from './terminal/kiroTerminal';
 import { CommandRegistry } from './commands/commandRegistry';
 import { KiroOverviewProvider } from './overview/overviewView';
 
@@ -25,31 +25,19 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     // API key authentication: stored in SecretStorage, never in settings
     manager.setApiKey(await context.secrets.get(API_KEY_SECRET));
 
-    const chatPanelProvider = new ChatPanelProvider(context.extensionUri, manager);
-    const specWorkflowManager = new SpecWorkflowManager(manager, chatPanelProvider);
-    chatPanelProvider.setSpecCallbacks(
-        (content) => specWorkflowManager.capturePhaseContent(content),
-        () => specWorkflowManager.advancePhase(),
-        () => specWorkflowManager.saveCurrentPhase(),
-        () => specWorkflowManager.cancelWorkflow()
-    );
-    // Messages typed during a spec revise the current document
-    chatPanelProvider.setSpecSession(
-        () => specWorkflowManager.isActive,
-        (text) => specWorkflowManager.buildRevisionPrompt(text),
-        () => specWorkflowManager.beginTurn()
-    );
+    // The chat is kiro-cli itself, running in a terminal beside the editor
+    const terminals = new KiroTerminalManager(manager, context.extensionUri);
+    const specWorkflowManager = new SpecWorkflowManager(manager, terminals);
 
     // Sidebar: launcher buttons (welcome content of an empty view) and the
     // "What Kiro Uses" overview of rules, specs, agents, skills, MCP servers
     const overview = new KiroOverviewProvider(manager);
-    chatPanelProvider.setRulesSource(() => overview.getConfig().rules);
 
-    const commandRegistry = new CommandRegistry(manager, chatPanelProvider, specWorkflowManager);
+    const commandRegistry = new CommandRegistry(manager, terminals, specWorkflowManager);
 
     context.subscriptions.push(
         manager,
-        chatPanelProvider,
+        terminals,
         commandRegistry,
         overview,
         ...commandRegistry.registerCommands(),
@@ -77,12 +65,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             }
             await context.secrets.store(API_KEY_SECRET, key.trim());
             manager.setApiKey(key.trim());
-            await restartWithNewCredentials(manager, chatPanelProvider, 'API key saved.');
+            await restartWithNewCredentials(manager, terminals, 'API key saved.');
         }),
         vscode.commands.registerCommand('kiro.clearApiKey', async () => {
             await context.secrets.delete(API_KEY_SECRET);
             manager.setApiKey(undefined);
-            await restartWithNewCredentials(manager, chatPanelProvider, 'API key removed. kiro-cli will use its own login.');
+            await restartWithNewCredentials(manager, terminals, 'API key removed. kiro-cli will use its own login.');
         }),
         context.secrets.onDidChange(async (e) => {
             if (e.key === API_KEY_SECRET) {
@@ -152,10 +140,13 @@ async function runLogin(manager: CliManager): Promise<void> {
     vscode.window.showErrorMessage('Kiro login failed. Please run "kiro-cli login" manually in your terminal.');
 }
 
-/** Verifies the new credentials and restarts a running CLI so they take effect. */
+/**
+ * Verifies the new credentials. A running Kiro terminal keeps the
+ * environment it started with, so offer to restart it.
+ */
 async function restartWithNewCredentials(
     manager: CliManager,
-    chatPanelProvider: ChatPanelProvider,
+    terminals: KiroTerminalManager,
     message: string
 ): Promise<void> {
     const cliPath = manager.resolvedCliPath ?? await manager.resolveCliPath();
@@ -163,20 +154,29 @@ async function restartWithNewCredentials(
         showCliNotFound();
         return;
     }
-    const wasRunning = manager.state.status === 'running';
     if (!(await manager.checkAuthentication(cliPath))) {
         vscode.window.showWarningMessage(`${message} However, "kiro-cli whoami" still reports you are not authenticated.`);
         return;
     }
-    if (wasRunning) {
-        await manager.restartProcess();
-        chatPanelProvider.postMessage({ type: 'systemMessage', message: `${message} Restarted kiro-cli with the new credentials.` });
+    const others = terminals.otherSessionCount;
+    const othersNote = others
+        ? ` ${others} open spec chat${others === 1 ? '' : 's'} keep${others === 1 ? 's' : ''} the old credentials until closed.`
+        : '';
+    if (!terminals.isRunning) {
+        vscode.window.showInformationMessage(`${message} Kiro CLI is authenticated.${othersNote}`);
+        return;
     }
-    vscode.window.showInformationMessage(`${message} Kiro CLI is authenticated.`);
+    const choice = await vscode.window.showInformationMessage(
+        `${message} Kiro CLI is authenticated. Restart the open Kiro chat to use the new credentials?${othersNote}`,
+        'Restart Chat',
+        'Later'
+    );
+    if (choice === 'Restart Chat') {
+        await terminals.restart();
+    }
 }
 
 export function deactivate(): void {
-    // Terminates the CLI process
     cliManager?.dispose();
     cliManager = undefined;
 }
