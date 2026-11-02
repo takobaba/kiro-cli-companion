@@ -2,7 +2,7 @@
     "name": "kiro-cli-companion",
     "displayName": "Kiro CLI Companion",
     "description": "Unofficial companion for the Kiro CLI: chat beside your code, plan features with specs, manage rules, and see what Kiro uses. Requires kiro-cli from kiro.dev.",
-    "version": "0.1.0",
+    "version": "0.0.1",
     "publisher": "takobaba",
     "author": "Takobaba",
     "license": "MIT",
