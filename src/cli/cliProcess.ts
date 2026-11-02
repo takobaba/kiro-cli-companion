@@ -1,20 +1,27 @@
 /**
- * CliProcess wraps a single Kiro CLI child process, handling ACP message
- * framing over stdin/stdout using newline-delimited JSON.
+ * CliProcess wraps a single `kiro-cli acp --agent-engine=v3` child process,
+ * handling ACP framing (newline-delimited JSON-RPC 2.0) over stdin/stdout.
  *
- * Implements the ACP protocol lifecycle:
- *   initialize → session/new → session/prompt → session/update notifications
+ * Lifecycle: initialize → session/new → session/prompt, with session/update
+ * notifications streaming the turn. The agent can also send requests to us
+ * (session/request_permission), which always get a response.
+ *
+ * Written against the CLI V3 ACP server; see
+ * https://kiro.dev/docs/cli/v3/acp-migration/
  */
 
 import * as vscode from 'vscode';
 import { spawn, ChildProcess } from 'child_process';
-import type { AcpResponse, ConfigOption } from '../types';
+import type { AcpResponse, ConfigOption, ConsentScope, ContextUsage, PermissionOption } from '../types';
 import { cliSpawnTarget } from './cliLocator';
 
 /** Shared output channel for ACP protocol debugging */
 const _log = vscode.window.createOutputChannel('Kiro ACP');
 
-/** Synthetic config option IDs for kiro-cli's `models` / `modes` session data. */
+/** Arguments that start the CLI V3 ACP server. Auth uses the `kiro-cli login` session (or KIRO_API_KEY). */
+export const ACP_ARGS = ['acp', '--agent-engine=v3'];
+
+/** Config option IDs advertised by kiro-cli V3. */
 export const MODEL_CONFIG_ID = 'model';
 export const MODE_CONFIG_ID = 'mode';
 
@@ -28,17 +35,103 @@ interface PendingRequest {
     reject: (error: Error) => void;
 }
 
+/** Consent context kiro-cli V3 attaches to a permission request (`_meta.kiro.consent`). */
+export interface ConsentContext {
+    capability?: string;
+    resource?: string;
+    triggeringResource?: string;
+    workspaceRoot?: string;
+    /** "explicit" means a rule asked; an allow rule can't be saved for it. */
+    askType?: string;
+    persistableConsent?: boolean;
+}
+
+/** A `session/request_permission` from the agent. */
+export interface PermissionRequest {
+    sessionId: string;
+    toolCallId?: string;
+    /** Human-readable title. Display only — never use it to decide. */
+    title: string;
+    options: PermissionOption[];
+    consent?: ConsentContext;
+}
+
+/** The user's answer. `scope` is used for "always" options only. */
+export type PermissionDecision = { optionId: string; scope?: ConsentScope } | { cancelled: true };
+
+/** A command the agent can run when sent as `/name args` (from available_commands_update). */
+export interface AvailableCommand {
+    name: string;
+    description: string;
+    hint?: string;
+}
+
+/**
+ * Builds the JSON-RPC result for a permission request. Returns only an option
+ * the agent offered; "always" options carry canonical consent metadata so
+ * kiro-cli can save the rule in the chosen scope (it defaults to the session).
+ */
+export function buildPermissionResult(request: PermissionRequest, decision: PermissionDecision): Record<string, unknown> {
+    if ('cancelled' in decision) {
+        return { outcome: { outcome: 'cancelled' } };
+    }
+    const option = request.options.find((o) => o.optionId === decision.optionId);
+    if (!option) {
+        // Never synthesize an option the agent didn't offer
+        return { outcome: { outcome: 'cancelled' } };
+    }
+    const result: Record<string, unknown> = { outcome: { outcome: 'selected', optionId: option.optionId } };
+    const isAlways = option.kind === 'allow_always' || option.kind === 'reject_always';
+    const consent = request.consent;
+    if (isAlways && consent) {
+        const resource = consent.triggeringResource ?? consent.resource;
+        result._meta = {
+            kiro: {
+                consent: {
+                    scope: decision.scope ?? 'session',
+                    ...(resource ? { resource } : {}),
+                    ...(consent.workspaceRoot ? { workspaceRoot: consent.workspaceRoot } : {}),
+                },
+            },
+        };
+    }
+    return result;
+}
+
+/** Converts a V3 `session_info_update` (kind `context_usage`) into the header's usage numbers. */
+export function parseContextUsage(kiro: Record<string, unknown>): ContextUsage | null {
+    const total = typeof kiro.usagePercentage === 'number'
+        ? kiro.usagePercentage
+        : (kiro.contextUsage as { usagePercentage?: number } | undefined)?.usagePercentage;
+    if (typeof total !== 'number') {
+        return null;
+    }
+    const b = (kiro.breakdown ?? {}) as Record<string, { percent?: number; mcp?: { percent?: number } } | undefined>;
+    const pct = (v: { percent?: number } | undefined) => (typeof v?.percent === 'number' ? v.percent : 0);
+    return {
+        total,
+        conversation: pct(b.yourPrompts) + pct(b.kiroResponses),
+        mcpTools: pct(b.tools?.mcp),
+        steeringFiles: pct(b.contextFiles),
+    };
+}
+
 export class CliProcess implements vscode.Disposable {
     private readonly _process: ChildProcess;
     private _alive: boolean = false;
     private readonly _pendingRequests = new Map<string, PendingRequest>();
     private _stdoutBuffer: string = '';
     private _sessionId: string | null = null;
+    /** Sessions replaced by "Clear chat"; their late updates are ignored. */
+    private readonly _retiredSessions = new Set<string>();
     private _onSessionUpdate: ((update: Record<string, unknown>) => void) | null = null;
-    private _onMetadata: ((metadata: Record<string, unknown>) => void) | null = null;
     private _onConfigOptionsChanged: ((options: ConfigOption[], message?: string) => void) | null = null;
+    private _onContextUsage: ((usage: ContextUsage) => void) | null = null;
+    private _onPermissionRequest: ((request: PermissionRequest) => Promise<PermissionDecision>) | null = null;
     private _requestCounter = 0;
     private _configOptions: ConfigOption[] = [];
+    private _extensionMethods: string[] = [];
+    private _availableCommands: AvailableCommand[] = [];
 
     private readonly _onDidExit = new vscode.EventEmitter<ExitInfo>();
     public readonly onDidExit: vscode.Event<ExitInfo> = this._onDidExit.event;
@@ -52,8 +145,8 @@ export class CliProcess implements vscode.Disposable {
         this.cwd = workspacePath;
         this.cliPath = cliPath;
         const target = cliSpawnTarget(cliPath);
-        _log.appendLine(`[CliProcess] Spawning: ${cliPath} acp (cwd: ${workspacePath}${target.shell ? ', via shell' : ''})`);
-        this._process = spawn(target.command, ['acp'], {
+        _log.appendLine(`[CliProcess] Spawning: ${cliPath} ${ACP_ARGS.join(' ')} (cwd: ${workspacePath}${target.shell ? ', via shell' : ''})`);
+        this._process = spawn(target.command, ACP_ARGS, {
             cwd: workspacePath,
             stdio: ['pipe', 'pipe', 'pipe'],
             shell: target.shell,
@@ -97,25 +190,37 @@ export class CliProcess implements vscode.Disposable {
         return this._sessionId;
     }
 
-    /** Config options received from the agent (e.g., model selector). */
+    /** Config options advertised by the agent (model, mode, …). */
     get configOptions(): ConfigOption[] {
         return this._configOptions;
     }
 
-    /**
-     * Sets a callback for `_kiro.dev/metadata` notifications.
-     * Used to receive context usage percentage and other metadata.
-     */
-    set onMetadata(handler: ((metadata: Record<string, unknown>) => void) | null) {
-        this._onMetadata = handler;
+    /** Commands the agent advertised; send them as `/name args` prompts. */
+    get availableCommands(): AvailableCommand[] {
+        return this._availableCommands;
+    }
+
+    /** True when `initialize` advertised the Kiro extension method (e.g. `_kiro/session/compact`). */
+    hasExtensionMethod(method: string): boolean {
+        return this._extensionMethods.includes(method);
+    }
+
+    /** Fired when the agent changes the model/mode on its own, with the updated options. */
+    set onConfigOptionsChanged(handler: ((options: ConfigOption[], message?: string) => void) | null) {
+        this._onConfigOptionsChanged = handler;
+    }
+
+    /** Fired for V3 `session_info_update` context-usage updates (also between turns). */
+    set onContextUsage(handler: ((usage: ContextUsage) => void) | null) {
+        this._onContextUsage = handler;
     }
 
     /**
-     * Sets a callback fired when the CLI changes the model/agent on its own
-     * (e.g. `/plan`, `/agent swap`, `/model`), with the updated options.
+     * Asks the user about a tool call. Without a handler, requests are denied
+     * once — tools are never approved without the user.
      */
-    set onConfigOptionsChanged(handler: ((options: ConfigOption[], message?: string) => void) | null) {
-        this._onConfigOptionsChanged = handler;
+    set onPermissionRequest(handler: ((request: PermissionRequest) => Promise<PermissionDecision>) | null) {
+        this._onPermissionRequest = handler;
     }
 
     /**
@@ -123,24 +228,33 @@ export class CliProcess implements vscode.Disposable {
      */
     async initializeAndCreateSession(workspacePath: string): Promise<string> {
         _log.appendLine(`[ACP] Starting initialize + session/new for ${workspacePath}`);
-        // Step 1: initialize (ACP protocol version is an integer; kiro-cli speaks v1)
         const initResponse = await this._sendRaw({
             jsonrpc: '2.0',
             id: this._nextId(),
             method: 'initialize',
-            params: { protocolVersion: 1, clientCapabilities: {} },
+            params: {
+                protocolVersion: 1,
+                // We don't serve files or terminals; kiro-cli uses its own tools
+                clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false },
+                clientInfo: { name: 'kiro-cli-companion', title: 'Kiro CLI Companion', version: '0' },
+            },
         });
 
         if (initResponse.error) {
             throw new Error(`ACP initialize failed: ${initResponse.error.message}`);
         }
-        _log.appendLine(`[ACP] Initialize OK`);
+        const caps = (initResponse.result as Record<string, unknown> | undefined)?.agentCapabilities as Record<string, unknown> | undefined;
+        const kiro = (caps?._meta as { kiro?: { extensionMethods?: unknown } } | undefined)?.kiro;
+        this._extensionMethods = Array.isArray(kiro?.extensionMethods)
+            ? kiro!.extensionMethods.filter((m): m is string => typeof m === 'string')
+            : [];
+        _log.appendLine(`[ACP] Initialize OK (${this._extensionMethods.length} extension methods)`);
         return this.createSession(workspacePath);
     }
 
     /**
      * Creates a fresh ACP session on the already-initialized process
-     * (used for "Clear chat" so slash-command state like /plan is reset).
+     * (used for "Clear chat" so the mode and history are reset).
      */
     async createSession(workspacePath: string = this.cwd): Promise<string> {
         const sessionResponse = await this._sendRaw({
@@ -158,115 +272,75 @@ export class CliProcess implements vscode.Disposable {
         }
 
         const result = sessionResponse.result as Record<string, unknown> | undefined;
-        this._sessionId = (result?.sessionId as string) || null;
-        if (!this._sessionId) {
+        const sessionId = (result?.sessionId as string) || null;
+        if (!sessionId) {
             throw new Error('ACP session/new did not return a sessionId');
         }
-
+        if (this._sessionId && this._sessionId !== sessionId) {
+            this._retiredSessions.add(this._sessionId);
+        }
+        this._sessionId = sessionId;
         _log.appendLine(`[ACP] Session created: ${this._sessionId}`);
 
-        // kiro-cli returns `models` and `modes` (agents); generic agents may
-        // return `configOptions`. Normalise all of them into ConfigOptions.
-        this._configOptions = [
-            ...this._parseModelsAndModes(result),
-            ...this._parseConfigOptions(result),
-        ];
-
+        // V3 advertises model and mode as configOptions; fall back to `modes`
+        // when an option is missing.
+        const options = this._parseConfigOptions(result);
+        if (!options.some((o) => o.id === MODE_CONFIG_ID)) {
+            options.push(...this._parseModes(result));
+        }
+        this._configOptions = options;
         return this._sessionId;
     }
 
     /**
-     * Changes a session option. Models and modes (agents) use the ACP
-     * `session/set_model` / `session/set_mode` methods; anything else goes
-     * through `session/set_config_option`.
+     * Changes an advertised option (model, mode, effortLevel, …) with
+     * `session/set_config_option`. CLI V3 has no `session/set_model`.
      */
     async setConfigOption(configId: string, value: string): Promise<ConfigOption[]> {
         if (!this._sessionId) {
             throw new Error('No active session. Call initializeAndCreateSession first.');
         }
-
-        if (configId === MODEL_CONFIG_ID || configId === MODE_CONFIG_ID) {
-            const isModel = configId === MODEL_CONFIG_ID;
-            const response = await this._sendRaw({
-                jsonrpc: '2.0',
-                id: this._nextId(),
-                method: isModel ? 'session/set_model' : 'session/set_mode',
-                params: isModel
-                    ? { sessionId: this._sessionId, modelId: value }
-                    : { sessionId: this._sessionId, modeId: value },
-            });
-            if (response.error) {
-                throw new Error(`${isModel ? 'set_model' : 'set_mode'} failed: ${(response.error as { message?: string }).message}`);
-            }
-            this._setCurrentValue(configId, value);
-            return this._configOptions;
-        }
-
-        const response = await this._sendRaw({
-            jsonrpc: '2.0',
-            id: this._nextId(),
-            method: 'session/set_config_option',
-            params: {
-                sessionId: this._sessionId,
-                configId,
-                value,
-            },
+        const result = await this.request('session/set_config_option', {
+            sessionId: this._sessionId,
+            configId,
+            value,
         });
-
-        if (response.error) {
-            throw new Error(`set_config_option failed: ${(response.error as { message?: string }).message}`);
-        }
-
-        const result = response.result as Record<string, unknown> | undefined;
-        const updated = this._parseConfigOptions(result);
+        const updated = this._parseConfigOptions(result as Record<string, unknown> | undefined);
         if (updated.length > 0) {
             this._configOptions = updated;
+        } else {
+            this._setCurrentValue(configId, value);
         }
         return this._configOptions;
     }
 
     /**
-     * Converts kiro-cli's `models` / `modes` session result into ConfigOptions.
-     *   models: { currentModelId, availableModels: [{ modelId, name, description }] }
-     *   modes:  { currentModeId,  availableModes:  [{ id, name, description }] }
+     * Sends a request and returns its result. Rejects with the agent's error.
+     * Use `hasExtensionMethod` before calling optional `_kiro/*` methods.
      */
-    private _parseModelsAndModes(result: Record<string, unknown> | undefined): ConfigOption[] {
-        const out: ConfigOption[] = [];
-        try {
-            const models = result?.models as { currentModelId?: string; availableModels?: Array<Record<string, unknown>> } | undefined;
-            if (models?.availableModels?.length) {
-                out.push({
-                    id: MODEL_CONFIG_ID,
-                    name: 'Model',
-                    description: 'Model used for this session',
-                    category: 'model',
-                    currentValue: models.currentModelId || '',
-                    options: models.availableModels.map((m) => ({
-                        value: String(m.modelId ?? ''),
-                        name: String(m.name ?? m.modelId ?? ''),
-                        description: String(m.description ?? ''),
-                    })),
-                });
-            }
-            const modes = result?.modes as { currentModeId?: string; availableModes?: Array<Record<string, unknown>> } | undefined;
-            if (modes?.availableModes?.length) {
-                out.push({
-                    id: MODE_CONFIG_ID,
-                    name: 'Agent',
-                    description: 'Agent (mode) used for this session',
-                    category: 'mode',
-                    currentValue: modes.currentModeId || '',
-                    options: modes.availableModes.map((m) => ({
-                        value: String(m.id ?? ''),
-                        name: String(m.name ?? m.id ?? ''),
-                        description: String(m.description ?? ''),
-                    })),
-                });
-            }
-        } catch {
-            _log.appendLine('[ACP] Failed to parse models/modes');
+    async request(method: string, params: Record<string, unknown>): Promise<unknown> {
+        const response = await this._sendRaw({ jsonrpc: '2.0', id: this._nextId(), method, params });
+        return response.result;
+    }
+
+    /** Converts the `modes` session result into a config option. */
+    private _parseModes(result: Record<string, unknown> | undefined): ConfigOption[] {
+        const modes = result?.modes as { currentModeId?: string; availableModes?: Array<Record<string, unknown>> } | undefined;
+        if (!modes?.availableModes?.length) {
+            return [];
         }
-        return out;
+        return [{
+            id: MODE_CONFIG_ID,
+            name: 'Mode',
+            description: 'Agent mode used for this session',
+            category: 'mode',
+            currentValue: modes.currentModeId || '',
+            options: modes.availableModes.map((m) => ({
+                value: String(m.id ?? ''),
+                name: String(m.name ?? m.id ?? ''),
+                description: String(m.description ?? ''),
+            })),
+        }];
     }
 
     /** Updates the current value of a config option; adds unknown values (e.g. custom agents). */
@@ -283,13 +357,12 @@ export class CliProcess implements vscode.Disposable {
     }
 
     /**
-     * Parses configOptions from an ACP response result object.
+     * Parses configOptions from an ACP result or update object.
      */
     private _parseConfigOptions(result: Record<string, unknown> | undefined): ConfigOption[] {
-        if (!result?.configOptions) {
+        if (!Array.isArray(result?.configOptions)) {
             return [];
         }
-
         try {
             const arr = result.configOptions as Array<Record<string, unknown>>;
             return arr.map((o) => {
@@ -315,8 +388,9 @@ export class CliProcess implements vscode.Disposable {
 
     /**
      * Sends a prompt to the current session and streams back updates.
-     * Calls onUpdate for each session/update notification.
-     * Resolves when the prompt turn completes (stopReason received).
+     * Calls onUpdate for each session/update notification of this session.
+     * Resolves when the `session/prompt` request returns (its stopReason) —
+     * not on a turn_end update, which V3 can send before it's done.
      */
     async sendPrompt(
         text: string,
@@ -363,6 +437,22 @@ export class CliProcess implements vscode.Disposable {
         });
     }
 
+    /**
+     * Asks the agent to stop the running turn (`session/cancel` notification).
+     * The agent then ends the pending `session/prompt` with stopReason
+     * "cancelled". The caller must cancel any open permission requests.
+     */
+    cancel(): void {
+        if (!this._alive || !this._sessionId) {
+            return;
+        }
+        this._writeToStdin({
+            jsonrpc: '2.0',
+            method: 'session/cancel',
+            params: { sessionId: this._sessionId },
+        });
+    }
+
     kill(): void {
         if (this._alive) {
             // Close stdin first: ACP agents exit on EOF. This also stops the real
@@ -400,23 +490,20 @@ export class CliProcess implements vscode.Disposable {
         // Log the method only — params can contain prompts and file contents
         _log.appendLine(`[stdin] ${message.method ?? 'response'} id=${message.id}`);
         const stdin = this._process.stdin;
-        if (!stdin || !stdin.writable) {
-            const id = message.id as string;
-            const pending = this._pendingRequests.get(id);
-            if (pending) {
-                this._pendingRequests.delete(id);
-                pending.reject(new Error('CLI process stdin is not writable'));
+        const failPending = (err: Error) => {
+            const pending = this._pendingRequests.get(String(message.id));
+            if (message.method && pending) {
+                this._pendingRequests.delete(String(message.id));
+                pending.reject(err);
             }
+        };
+        if (!stdin || !stdin.writable) {
+            failPending(new Error('CLI process stdin is not writable'));
             return;
         }
         stdin.write(json, (err) => {
             if (err) {
-                const id = message.id as string;
-                const pending = this._pendingRequests.get(id);
-                if (pending) {
-                    this._pendingRequests.delete(id);
-                    pending.reject(err);
-                }
+                failPending(err);
             }
         });
     }
@@ -435,6 +522,12 @@ export class CliProcess implements vscode.Disposable {
         }
     }
 
+    /** True for updates of a session that "Clear chat" replaced. */
+    private _isRetired(params: Record<string, unknown> | undefined): boolean {
+        const sessionId = params?.sessionId;
+        return typeof sessionId === 'string' && this._retiredSessions.has(sessionId);
+    }
+
     private _processLine(line: string): void {
         let parsed: Record<string, unknown>;
         try {
@@ -444,63 +537,24 @@ export class CliProcess implements vscode.Disposable {
             return;
         }
 
-        const method = parsed.method as string | undefined;
-        const id = parsed.id as string | undefined;
+        const method = typeof parsed.method === 'string' ? parsed.method : undefined;
+        // IDs may be numbers, and 0 is valid (V3's first permission request uses id 0)
+        const rawId = parsed.id as string | number | null | undefined;
+        const hasId = rawId !== undefined && rawId !== null;
+        const params = parsed.params as Record<string, unknown> | undefined;
 
-        // Handle requests FROM the CLI (has both id and method)
-        // e.g. session/request_permission
-        if (id && method) {
-            _log.appendLine(`[ACP] incoming request: ${method} id=${id}`);
-            this._handleIncomingRequest(id, method, parsed.params as Record<string, unknown> | undefined);
+        // Requests FROM the agent (id + method) always get a response
+        if (hasId && method) {
+            _log.appendLine(`[ACP] incoming request: ${method} id=${rawId}`);
+            void this._handleIncomingRequest(rawId, method, params);
             return;
         }
 
-        // Handle notifications (has method but no id) — e.g. session/update
-        if (!id && method) {
+        // Notifications (method, no id)
+        if (method) {
             if (method === 'session/update') {
-                const params = parsed.params as Record<string, unknown> | undefined;
-                const update = params?.update as Record<string, unknown> | undefined;
-                // Standard ACP mode change notification — track it even between prompts
-                if (update?.sessionUpdate === 'current_mode_update' && typeof update.currentModeId === 'string') {
-                    if (this._setCurrentValue(MODE_CONFIG_ID, update.currentModeId)) {
-                        this._onConfigOptionsChanged?.(this._configOptions, `Switched to agent "${update.currentModeId}"`);
-                    }
-                } else if (update?.sessionUpdate === 'config_options_update') {
-                    // Agents that use generic config options (rather than models/modes)
-                    const changed = this._parseConfigOptions(update);
-                    if (changed.length) {
-                        for (const option of changed) {
-                            const i = this._configOptions.findIndex((o) => o.id === option.id);
-                            if (i >= 0) {
-                                this._configOptions[i] = option;
-                            } else {
-                                this._configOptions.push(option);
-                            }
-                        }
-                        this._onConfigOptionsChanged?.(this._configOptions);
-                    }
-                }
-                if (update && this._onSessionUpdate) {
-                    this._onSessionUpdate(update);
-                }
-            } else if (method === '_kiro.dev/metadata') {
-                const params = parsed.params as Record<string, unknown> | undefined;
-                if (params && this._onMetadata) {
-                    this._onMetadata(params);
-                }
-            } else if (method === '_kiro.dev/agent/switched') {
-                // Fired after /plan, /agent swap, set_mode, etc.
-                const params = parsed.params as Record<string, unknown> | undefined;
-                const agent = params?.agentName as string | undefined;
-                const model = params?.model as string | undefined;
-                _log.appendLine(`[ACP] agent switched to ${agent} (model ${model})`);
-                const changedMode = agent ? this._setCurrentValue(MODE_CONFIG_ID, agent) : false;
-                const changedModel = model ? this._setCurrentValue(MODEL_CONFIG_ID, model) : false;
-                if (changedMode || changedModel) {
-                    this._onConfigOptionsChanged?.(
-                        this._configOptions,
-                        changedMode ? `Switched to agent "${agent}"` : undefined
-                    );
+                if (!this._isRetired(params)) {
+                    this._handleSessionUpdate(params?.update as Record<string, unknown> | undefined);
                 }
             } else {
                 _log.appendLine(`[ACP] notification: ${method}`);
@@ -508,8 +562,9 @@ export class CliProcess implements vscode.Disposable {
             return;
         }
 
-        // Handle responses to our pending requests (has id but no method)
-        if (id && !method) {
+        // Responses to our requests (id, no method)
+        if (hasId) {
+            const id = String(rawId);
             const pending = this._pendingRequests.get(id);
             if (!pending) {
                 _log.appendLine(`[ACP] response id=${id} but no pending request`);
@@ -521,9 +576,11 @@ export class CliProcess implements vscode.Disposable {
 
             if (parsed.error) {
                 const err = parsed.error as { message?: string; code?: number; data?: unknown };
-                // kiro-cli puts the useful explanation in `data`, e.g.
-                // "Failed to start session: Session is active in another process (PID 1234)"
-                const detail = typeof err.data === 'string' && err.data.trim() ? `: ${err.data.trim()}` : '';
+                // kiro-cli puts the useful explanation in `data`, either as a
+                // string or as { details: "…" }
+                const data = err.data as string | { details?: unknown } | undefined;
+                const detailText = typeof data === 'string' ? data : typeof data?.details === 'string' ? data.details : '';
+                const detail = detailText.trim() ? `: ${detailText.trim()}` : '';
                 const error = new Error((err.message || 'ACP error') + detail) as Error & { code?: number };
                 error.code = err.code;
                 pending.reject(error);
@@ -536,55 +593,115 @@ export class CliProcess implements vscode.Disposable {
         _log.appendLine(`[ACP] unhandled message: ${line.substring(0, 100)}`);
     }
 
+    /** Tracks session-level state from updates, then forwards them to the running prompt. */
+    private _handleSessionUpdate(update: Record<string, unknown> | undefined): void {
+        if (!update) {
+            return;
+        }
+        switch (update.sessionUpdate) {
+            case 'current_mode_update':
+                if (typeof update.currentModeId === 'string' && this._setCurrentValue(MODE_CONFIG_ID, update.currentModeId)) {
+                    this._onConfigOptionsChanged?.(this._configOptions, `Switched to mode "${update.currentModeId}"`);
+                }
+                break;
+            case 'config_option_update': {
+                // A full snapshot of the advertised options
+                const options = this._parseConfigOptions(update);
+                if (options.length) {
+                    const before = this._configOptions.find((o) => o.id === MODE_CONFIG_ID)?.currentValue;
+                    this._configOptions = options;
+                    const after = options.find((o) => o.id === MODE_CONFIG_ID)?.currentValue;
+                    this._onConfigOptionsChanged?.(
+                        this._configOptions,
+                        before && after && before !== after ? `Switched to mode "${after}"` : undefined
+                    );
+                }
+                break;
+            }
+            case 'available_commands_update':
+                if (Array.isArray(update.availableCommands)) {
+                    this._availableCommands = (update.availableCommands as Array<Record<string, unknown>>)
+                        .filter((c) => typeof c.name === 'string')
+                        .map((c) => ({
+                            name: c.name as string,
+                            description: typeof c.description === 'string' ? c.description : '',
+                            hint: (c.input as { hint?: string } | undefined)?.hint,
+                        }));
+                }
+                break;
+            case 'session_info_update': {
+                const kiro = (update._meta as { kiro?: Record<string, unknown> } | undefined)?.kiro;
+                if (kiro?.kind === 'context_usage') {
+                    const usage = parseContextUsage(kiro);
+                    if (usage) {
+                        this._onContextUsage?.(usage);
+                    }
+                }
+                break;
+            }
+        }
+        this._onSessionUpdate?.(update);
+    }
+
     /**
-     * Handles incoming JSON-RPC requests from the CLI that expect a response.
-     * Currently handles session/request_permission by auto-approving.
+     * Answers JSON-RPC requests from the agent. Unknown methods get an error
+     * so the agent never waits forever.
      */
-    private _handleIncomingRequest(
-        id: string,
+    private async _handleIncomingRequest(
+        id: string | number,
         method: string,
         params: Record<string, unknown> | undefined
-    ): void {
+    ): Promise<void> {
         if (method === 'session/request_permission') {
-            const options = params?.options as Array<{ optionId: string; kind: string }> | undefined;
-            // Auto-approve: pick "allow_once" option
-            const allowOption = options?.find(o => o.kind === 'allow_once');
-            const optionId = allowOption?.optionId ?? 'allow_once';
-
-            const toolCall = params?.toolCall as Record<string, unknown> | undefined;
-            _log.appendLine(`[ACP] Auto-approving permission for: ${toolCall?.title ?? 'unknown'} (optionId=${optionId})`);
-
-            // ACP spec requires outcome wrapper with "selected" discriminator
-            this._writeToStdin({
-                jsonrpc: '2.0',
-                id,
-                result: {
-                    outcome: {
-                        outcome: 'selected',
-                        optionId,
-                    },
-                },
-            });
+            const request = this._parsePermissionRequest(params);
+            let decision: PermissionDecision;
+            if (this._isRetired(params)) {
+                decision = { cancelled: true };
+            } else if (this._onPermissionRequest) {
+                try {
+                    decision = await this._onPermissionRequest(request);
+                } catch (err) {
+                    _log.appendLine(`[ACP] Permission handler failed: ${err}`);
+                    decision = { cancelled: true };
+                }
+            } else {
+                const reject = request.options.find((o) => o.kind === 'reject_once');
+                decision = reject ? { optionId: reject.optionId } : { cancelled: true };
+            }
+            const result = buildPermissionResult(request, decision);
+            const outcome = result.outcome as { outcome: string; optionId?: string };
+            _log.appendLine(`[ACP] Permission for ${request.consent?.capability ?? 'tool'}: ${outcome.optionId ?? outcome.outcome}`);
+            this._writeToStdin({ jsonrpc: '2.0', id, result });
             return;
         }
 
-        if (method === 'session/request_input') {
-            // Some CLI versions send input requests — auto-respond with empty
-            _log.appendLine(`[ACP] Auto-responding to input request id=${id}`);
-            this._writeToStdin({
-                jsonrpc: '2.0',
-                id,
-                result: { input: '' },
-            });
-            return;
-        }
-
-        _log.appendLine(`[ACP] Unknown incoming request method: ${method}, responding with error`);
+        _log.appendLine(`[ACP] Unsupported incoming request: ${method}, responding with error`);
         this._writeToStdin({
             jsonrpc: '2.0',
             id,
             error: { code: -32601, message: `Method not supported: ${method}` },
         });
+    }
+
+    private _parsePermissionRequest(params: Record<string, unknown> | undefined): PermissionRequest {
+        const toolCall = (params?.toolCall ?? {}) as Record<string, unknown>;
+        const options = Array.isArray(params?.options)
+            ? (params!.options as Array<Record<string, unknown>>)
+                .filter((o) => typeof o.optionId === 'string')
+                .map((o) => ({
+                    optionId: o.optionId as string,
+                    name: typeof o.name === 'string' ? o.name : (o.optionId as string),
+                    kind: typeof o.kind === 'string' ? o.kind : '',
+                }))
+            : [];
+        const consent = ((params?._meta as { kiro?: { consent?: ConsentContext } } | undefined)?.kiro?.consent);
+        return {
+            sessionId: typeof params?.sessionId === 'string' ? params.sessionId : '',
+            toolCallId: typeof toolCall.toolCallId === 'string' ? toolCall.toolCallId : undefined,
+            title: typeof toolCall.title === 'string' ? toolCall.title : 'Tool call',
+            options,
+            consent: consent && typeof consent === 'object' ? consent : undefined,
+        };
     }
 
     private _rejectAllPending(error: Error): void {

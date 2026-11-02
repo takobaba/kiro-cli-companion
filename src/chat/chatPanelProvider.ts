@@ -4,28 +4,57 @@
  * Creates and manages a vscode.WebviewPanel with retainContextWhenHidden,
  * handles incoming messages from the Webview, sends ACP streaming requests
  * through the CLI, and forwards responses/errors back to the Webview.
- *
- * Requirements: 4.1–4.8, 11.1–11.4, 12.1–12.5, 13.1
  */
 
 import * as vscode from 'vscode';
 import * as path from 'path';
 import * as fs from 'fs';
-import { execFile } from 'child_process';
-import { cliSpawnTarget } from '../cli/cliLocator';
+import { randomBytes } from 'crypto';
 import { CliManager } from '../cli/cliManager';
-import { CliProcess, MODE_CONFIG_ID } from '../cli/cliProcess';
+import { ACP_ARGS, CliProcess, MODE_CONFIG_ID, PermissionDecision, PermissionRequest } from '../cli/cliProcess';
 import { AppliedRule, Rule, formatRulesBlock, rulesToAttach } from '../rules/rules';
-import { WorkspaceContextProvider } from '../context/workspaceContextProvider';
-import type { ExtToWebviewMessage, WebviewToExtMessage, ContextUsage } from '../types';
+import { BUILTIN_COMMANDS, parseSlashCommand } from './slashCommands';
+import type { ConsentScope, ExtToWebviewMessage, WebviewToExtMessage, ContextUsage } from '../types';
 
 const VIEW_TYPE = 'kiro.chatPanel';
 const _log = vscode.window.createOutputChannel('Kiro Chat');
 
+/** A turn is either a prompt for kiro-cli or a client-side action (e.g. a slash command). */
+type Turn = { prompt: string; isSpecPrompt: boolean } | { action: () => Promise<void> };
+
 export class ChatPanelProvider implements vscode.Disposable {
     private _panel: vscode.WebviewPanel | undefined;
-    private _lastFailedMessage: string | null = null;
+    /** Last prompt that failed, exactly as it was sent (already enriched). */
+    private _lastFailed: { prompt: string; isSpecPrompt: boolean } | null = null;
     private readonly _disposables: vscode.Disposable[] = [];
+    /** Permission cards waiting for the user, by request ID. */
+    private readonly _pendingPermissions = new Map<string, { request: PermissionRequest; scopes: ConsentScope[]; resolve: (d: PermissionDecision) => void }>();
+    private _permissionCounter = 0;
+
+    /**
+     * Prompt queue. kiro-cli handles one turn at a time, so — like the CLI's
+     * own chat — messages sent while Kiro is working wait for the current turn
+     * to finish. Every turn is chained onto `_turnChain`.
+     */
+    private _turnChain: Promise<void> = Promise.resolve();
+    /** Turns that are running or waiting to run. */
+    private _pendingTurns = 0;
+    /** Bumped to discard everything still waiting (clear chat, failed turn). */
+    private _queueGeneration = 0;
+    /**
+     * True once a message was sent in this conversation. The working directory
+     * is fixed from then on; clearing the chat starts a new conversation.
+     */
+    private _conversationStarted = false;
+    /** Set by the Stop button (or clear chat) while a turn runs; reset when the next turn starts. */
+    private _stopRequested = false;
+    /** Bumped when the chat is cleared, so a turn from the old chat stays quiet. */
+    private _chatEpoch = 0;
+
+    /** True when the working directory can no longer change for this conversation. */
+    get isWorkingDirectoryLocked(): boolean {
+        return this._conversationStarted;
+    }
 
     /** Current context usage data. */
     private _contextUsage: ContextUsage = { conversation: 0, mcpTools: 0, steeringFiles: 0, total: 0 };
@@ -55,8 +84,7 @@ export class ChatPanelProvider implements vscode.Disposable {
 
     constructor(
         private readonly _extensionUri: vscode.Uri,
-        private readonly _cliManager: CliManager,
-        _contextProvider: WorkspaceContextProvider
+        private readonly _cliManager: CliManager
     ) {
         // Seed with the current active editor
         this._lastActiveTextEditor = vscode.window.activeTextEditor;
@@ -84,7 +112,7 @@ export class ChatPanelProvider implements vscode.Disposable {
                     const sessionId = state.process.sessionId ?? 'unknown';
                     this._postMessage({
                         type: 'systemMessage',
-                        message: `Started "kiro-cli acp" in ${state.cwd} (session ${sessionId})`,
+                        message: `Started "kiro-cli ${ACP_ARGS.join(' ')}" in ${state.cwd} (session ${sessionId})`,
                     });
                 }
                 this._postSessionInfo();
@@ -94,7 +122,11 @@ export class ChatPanelProvider implements vscode.Disposable {
 
     /** Wires process callbacks and pushes its model/agent options to the webview. */
     private _attachProcess(cliProcess: CliProcess): void {
-        cliProcess.onMetadata = (metadata) => this._handleMetadataNotification(metadata);
+        cliProcess.onContextUsage = (usage) => {
+            this._contextUsage = usage;
+            this._postMessage({ type: 'contextUsage', usage });
+        };
+        cliProcess.onPermissionRequest = (request) => this._askPermission(request);
         cliProcess.onConfigOptionsChanged = (options, message) => {
             this._postMessage({ type: 'configOptions', options });
             if (message) {
@@ -104,6 +136,71 @@ export class ChatPanelProvider implements vscode.Disposable {
         if (cliProcess.configOptions.length > 0) {
             this._postMessage({ type: 'configOptions', options: cliProcess.configOptions });
         }
+    }
+
+    /**
+     * Shows a permission card with the options kiro-cli offered and waits for
+     * the user. Without a chat panel nobody can answer, so the call is denied.
+     */
+    private _askPermission(request: PermissionRequest): Promise<PermissionDecision> {
+        if (!this._panel) {
+            const reject = request.options.find((o) => o.kind === 'reject_once');
+            return Promise.resolve(reject ? { optionId: reject.optionId } : { cancelled: true });
+        }
+        // Asked after Stop was pressed: the turn is ending, so don't show a new card
+        if (this._stopRequested) {
+            return Promise.resolve({ cancelled: true });
+        }
+        const requestId = `perm-${++this._permissionCounter}`;
+        // Workspace rules need a workspace root from kiro-cli; user rules apply everywhere
+        const scopes: ConsentScope[] = request.consent?.workspaceRoot ? ['workspace', 'user', 'session'] : ['user', 'session'];
+        this._panel.reveal(undefined, true);
+        this._postMessage({
+            type: 'permissionRequest',
+            request: {
+                requestId,
+                title: request.title,
+                capability: request.consent?.capability,
+                resource: request.consent?.triggeringResource ?? request.consent?.resource,
+                options: request.options,
+                scopes,
+            },
+        });
+        return new Promise<PermissionDecision>((resolve) => {
+            this._pendingPermissions.set(requestId, { request, scopes, resolve });
+        });
+    }
+
+    /** Applies the user's answer from a permission card. */
+    private _answerPermission(requestId: string, optionId: string, scope?: ConsentScope): void {
+        const pending = this._pendingPermissions.get(requestId);
+        if (!pending) {
+            return;
+        }
+        this._pendingPermissions.delete(requestId);
+        const option = pending.request.options.find((o) => o.optionId === optionId);
+        if (!option) {
+            pending.resolve({ cancelled: true });
+            this._postMessage({ type: 'permissionResolved', requestId, label: 'Cancelled' });
+            return;
+        }
+        const isAlways = option.kind === 'allow_always' || option.kind === 'reject_always';
+        // Only accept a scope this card actually offered
+        if (scope !== undefined && !pending.scopes.includes(scope)) {
+            scope = undefined;
+        }
+        const where = scope === 'workspace' ? ' (this workspace)' : scope === 'user' ? ' (all projects)' : scope === 'session' ? ' (this session)' : '';
+        pending.resolve({ optionId, scope: isAlways ? scope : undefined });
+        this._postMessage({ type: 'permissionResolved', requestId, label: `${option.name}${isAlways ? where : ''}` });
+    }
+
+    /** Cancels every open permission card (chat cleared, panel closed). */
+    private _cancelPendingPermissions(): void {
+        for (const [requestId, pending] of this._pendingPermissions) {
+            pending.resolve({ cancelled: true });
+            this._postMessage({ type: 'permissionResolved', requestId, label: 'Cancelled' });
+        }
+        this._pendingPermissions.clear();
     }
 
     /**
@@ -127,6 +224,22 @@ export class ChatPanelProvider implements vscode.Disposable {
 
     /** Clears the chat and starts a fresh CLI session (resets /plan, /agent, history). */
     private async _clearAndStartNewSession(): Promise<void> {
+        // Queued messages belong to the conversation being cleared
+        this._discardQueuedTurns();
+        // So does a tool waiting for approval
+        this._cancelPendingPermissions();
+        this._chatEpoch++;
+        // And a reply still being written: cancel it on the old session, before
+        // newSession() replaces it, so new messages don't wait behind it
+        if (this._pendingTurns > 0) {
+            this._stopRequested = true;
+            if (this._cliManager.state.status === 'running') {
+                this._cliManager.state.process.cancel();
+            }
+        }
+        // A new conversation may start in a different folder
+        this._conversationStarted = false;
+        this._postSessionInfo();
         this._postMessage({ type: 'clearChat' });
         this._contextUsage = { conversation: 0, mcpTools: 0, steeringFiles: 0, total: 0 };
         this._postMessage({ type: 'contextUsage', usage: this._contextUsage });
@@ -146,7 +259,10 @@ export class ChatPanelProvider implements vscode.Disposable {
         if (!this._panel) {
             return;
         }
-        this._postMessage({ type: 'sessionInfo', info: this._cliManager.getSessionInfo() });
+        this._postMessage({
+            type: 'sessionInfo',
+            info: { ...this._cliManager.getSessionInfo(), locked: this._conversationStarted },
+        });
     }
 
     /**
@@ -191,6 +307,7 @@ export class ChatPanelProvider implements vscode.Disposable {
             return;
         }
 
+        const groupsBefore = vscode.window.tabGroups.all.length;
         this._panel = vscode.window.createWebviewPanel(
             VIEW_TYPE,
             'Kiro Chat',
@@ -204,13 +321,16 @@ export class ChatPanelProvider implements vscode.Disposable {
 
         this._panel.webview.html = this._getWebviewContent();
 
-        // Set editor layout to make the panel 1/4 width after the panel is created
-        setTimeout(() => {
-            vscode.commands.executeCommand('vscode.setEditorLayout', {
-                orientation: 0,
-                groups: [{ size: 0.75 }, { size: 0.25 }]
-            });
-        }, 100);
+        // Make the chat a narrow (1/4) column on the right — but only when the
+        // user had a single editor group, so their own splits/sizes are kept.
+        if (groupsBefore === 1) {
+            setTimeout(() => {
+                vscode.commands.executeCommand('vscode.setEditorLayout', {
+                    orientation: 0,
+                    groups: [{ size: 0.75 }, { size: 0.25 }],
+                });
+            }, 100);
+        }
 
         // Prevent files from opening in the chat panel's column.
         this._panel.onDidChangeViewState(
@@ -237,6 +357,7 @@ export class ChatPanelProvider implements vscode.Disposable {
         this._panel.onDidDispose(
             () => {
                 this._panel = undefined;
+                this._cancelPendingPermissions();
             },
             undefined,
             this._disposables
@@ -253,13 +374,117 @@ export class ChatPanelProvider implements vscode.Disposable {
     }
 
     /**
+     * Runs a turn after every earlier turn has finished.
+     *
+     * `build` is called when the turn actually starts, so it sees state left
+     * by earlier turns (e.g. the spec document a revision applies to). It may
+     * return null to skip the turn. Returns when this turn has finished.
+     *
+     * @param queueId Webview bubble ID, so the webview can show it as queued.
+     */
+    private _enqueueTurn(
+        build: () => Turn | null,
+        queueId?: string
+    ): Promise<void> {
+        const generation = this._queueGeneration;
+        const waits = this._pendingTurns > 0;
+        if (!this._conversationStarted) {
+            this._conversationStarted = true;
+            this._postSessionInfo();
+        }
+        this._pendingTurns++;
+        if (waits && queueId) {
+            this._postMessage({ type: 'messageQueued', id: queueId });
+        }
+
+        const turn = this._turnChain.then(async () => {
+            try {
+                if (generation !== this._queueGeneration) {
+                    if (queueId) {
+                        this._postMessage({ type: 'messageDropped', id: queueId });
+                    }
+                    return;
+                }
+                if (waits && queueId) {
+                    this._postMessage({ type: 'messageDequeued', id: queueId });
+                }
+                // Once per turn, so a Stop during a slash command's setup
+                // (e.g. "/model x then text") also skips the prompt that follows
+                this._stopRequested = false;
+                const next = build();
+                if (!next) {
+                    return;
+                }
+                if ('action' in next) {
+                    await next.action();
+                    return;
+                }
+                await this._sendPromptInternal(next.prompt, next.isSpecPrompt);
+            } finally {
+                this._pendingTurns--;
+            }
+        });
+        this._turnChain = turn.catch((err) => _log.appendLine(`[Chat] Turn failed: ${err}`));
+        return turn;
+    }
+
+    /** Drops turns that haven't started yet. The running turn is unaffected. */
+    private _discardQueuedTurns(reason?: string): void {
+        this._queueGeneration++;
+        // Turns still waiting = all pending minus the one currently running
+        const waiting = Math.max(0, this._pendingTurns - 1);
+        if (reason && waiting > 0) {
+            this._postMessage({
+                type: 'systemMessage',
+                message: `${waiting} queued message${waiting === 1 ? ' was' : 's were'} not sent ${reason}.`,
+            });
+        }
+    }
+
+    /**
+     * Stop button: cancels the running turn and drops queued messages, so
+     * Kiro actually stops instead of moving on to the next one.
+     */
+    private _stop(): void {
+        if (this._pendingTurns === 0) {
+            return;
+        }
+        this._stopRequested = true;
+        this._discardQueuedTurns('because you stopped Kiro');
+        // ACP: open permission requests must be answered "cancelled"
+        this._cancelPendingPermissions();
+        if (this._cliManager.state.status === 'running') {
+            this._cliManager.state.process.cancel();
+        }
+    }
+
+    /** Resolves once no turn is running or queued (including ones queued meanwhile). */
+    async whenIdle(): Promise<void> {
+        let chain: Promise<void>;
+        do {
+            chain = this._turnChain;
+            await chain;
+            // Let follow-ups queued from callbacks (e.g. Retry) register
+            await new Promise<void>((r) => setImmediate(r));
+        } while (chain !== this._turnChain || this._pendingTurns > 0);
+    }
+
+    /**
      * Sends a prompt through the CLI and streams the response to the Webview.
-     * This is the core send method used by both regular messages and spec prompts.
+     * Only call through `_enqueueTurn` — kiro-cli runs one turn at a time.
      *
      * @param promptText The text to send (already enriched or raw)
      * @param isSpecPrompt If true, captures content for spec workflow
      */
     private async _sendPromptInternal(promptText: string, isSpecPrompt: boolean = false): Promise<void> {
+        const epoch = this._chatEpoch;
+        // Stopped before this prompt was reached (e.g. during a slash command's setup)
+        if (this._stopRequested) {
+            if (epoch === this._chatEpoch) {
+                this._postMessage({ type: 'systemMessage', message: 'Stopped.' });
+            }
+            return;
+        }
         // Send loading start
         this._postMessage({ type: 'loading', active: true });
         // The reply to this turn becomes the spec document (replacing earlier drafts)
@@ -269,18 +494,26 @@ export class ChatPanelProvider implements vscode.Disposable {
 
         try {
             const cliProcess = await this._cliManager.ensureProcess();
-            _log.appendLine(`[Chat] Sending prompt: "${promptText.substring(0, 120)}"`);
+            // Log size only — prompts can contain file contents
+            _log.appendLine(`[Chat] Sending prompt (${promptText.length} chars)`);
             this._attachProcess(cliProcess);
 
+            // Stopped while kiro-cli was still starting: don't send at all
+            if (this._stopRequested) {
+                this._postMessage({ type: 'response', content: '', done: true });
+                if (epoch === this._chatEpoch) {
+                    this._postMessage({ type: 'systemMessage', message: 'Stopped.' });
+                }
+                return;
+            }
+
             // Use the ACP session/prompt flow with session/update notifications
-            await cliProcess.sendPrompt(promptText, (update) => {
+            const result = await cliProcess.sendPrompt(promptText, (update) => {
                 const sessionUpdate = update.sessionUpdate as string;
-                _log.appendLine(`[Chat] Got update: ${sessionUpdate}`);
 
                 if (sessionUpdate === 'agent_message_chunk') {
                     const content = update.content as { type: string; text?: string } | undefined;
                     if (content?.text) {
-                        _log.appendLine(`[Chat] Chunk: "${content.text.substring(0, 50)}"`);
                         this._postMessage({ type: 'response', content: content.text, done: false });
 
                         // Capture content for spec workflow if active
@@ -292,23 +525,21 @@ export class ChatPanelProvider implements vscode.Disposable {
                     const title = update.title as string | undefined;
                     const status = update.status as string | undefined;
                     const kind = update.kind as string | undefined;
-                    if (title) {
-                        _log.appendLine(`[Chat] Tool: ${title} [${status || ''}]`);
-                        this._postMessage({ type: 'toolStatus', title, status: status || '', kind: kind || '' });
+                    const toolCallId = update.toolCallId as string | undefined;
+                    // Updates may carry only an ID and a status (no title)
+                    if (title || (toolCallId && status)) {
+                        _log.appendLine(`[Chat] Tool: ${title ?? toolCallId} [${status || ''}]`);
+                        this._postMessage({ type: 'toolStatus', title: title || '', status: status || '', kind: kind || '', toolCallId });
                     }
-                } else if (sessionUpdate === 'config_options_update') {
-                    this._parseAndSendConfigOptions(update);
-                } else if (sessionUpdate === 'context_usage') {
-                    this._handleContextUsageUpdate(update);
                 }
             });
 
-            _log.appendLine(`[Chat] Prompt completed`);
+            _log.appendLine(`[Chat] Prompt completed (${String(result.stopReason ?? 'end_turn')})`);
             this._postMessage({ type: 'response', content: '', done: true });
-            this._lastFailedMessage = null;
-
-            // Refresh workspace files to detect changes made by the CLI (Requirement 13.1)
-            this._refreshWorkspaceFiles();
+            if ((result.stopReason === 'cancelled' || this._stopRequested) && epoch === this._chatEpoch) {
+                this._postMessage({ type: 'systemMessage', message: 'Stopped.' });
+            }
+            this._lastFailed = null;
         } catch (err) {
             const rawMessage = err instanceof Error ? err.message : 'An unknown error occurred';
             const errorCode = (err as { code?: number } | undefined)?.code;
@@ -333,41 +564,63 @@ export class ChatPanelProvider implements vscode.Disposable {
                     : rawMessage;
 
             this._postMessage({ type: 'error', message: displayMessage });
-            this._lastFailedMessage = promptText;
+            this._lastFailed = { prompt: promptText, isSpecPrompt };
+            // Don't fire queued follow-ups at a broken session. Done before the
+            // notification so a Retry from it isn't discarded too.
+            this._discardQueuedTurns('because the previous message failed');
 
+            // Don't await the notification: it would hold up the queue until dismissed
             const actions = isSessionError || isInternalError ? ['Retry', 'Restart CLI'] : ['Retry'];
-            const action = await vscode.window.showErrorMessage(
+            void Promise.resolve(vscode.window.showErrorMessage(
                 `Communication error: ${displayMessage}`,
                 ...actions
-            );
-            if (action === 'Retry') {
-                this._sendPromptInternal(promptText, isSpecPrompt);
-            } else if (action === 'Restart CLI') {
-                vscode.commands.executeCommand('kiro.restartCli');
-            }
+            )).then((action) => {
+                if (action === 'Retry') {
+                    this._retryLastFailed();
+                } else if (action === 'Restart CLI') {
+                    vscode.commands.executeCommand('kiro.restartCli');
+                }
+            });
         } finally {
             this._postMessage({ type: 'loading', active: false });
         }
     }
 
+    /** Re-sends the last failed prompt as-is (it already carries its context). */
+    private _retryLastFailed(): Promise<void> | undefined {
+        const failed = this._lastFailed;
+        if (!failed) {
+            return undefined;
+        }
+        this._lastFailed = null;
+        return this._enqueueTurn(() => failed);
+    }
+
     /**
      * Sends a user message through the CLI and streams the response to the Webview.
-     * Prepends active file context before sending.
+     * Prepends active file context before sending. If Kiro is still working on
+     * an earlier message, this one is queued and sent when that turn ends.
+     *
+     * @param queueId Webview bubble ID used to show the message as queued
      */
-    async handleUserMessage(text: string): Promise<void> {
+    async handleUserMessage(text: string, queueId?: string): Promise<void> {
         if (!this._panel) {
             return;
         }
-        // Slash commands (/agent, /plan, /context, …) must reach kiro-cli as the
-        // very first characters, otherwise they're sent to the model as plain
-        // text. Send them without editor context.
-        const isSlashCommand = text.trimStart().startsWith('/');
-        if (isSlashCommand) {
-            await this._sendPromptInternal(text.trim(), false);
-            return;
+        // Slash commands: CLI V3 has no generic command API, so each one is
+        // routed here (see slashCommands.ts). They're sent without editor context.
+        if (text.trimStart().startsWith('/')) {
+            const command = text.trim();
+            if (/^\/clear\b/i.test(command)) {
+                // Like the 🗑 button: also drops queued messages, so don't queue it
+                await this._clearAndStartNewSession();
+                return;
+            }
+            return this._enqueueTurn(() => ({ action: () => this._runSlashCommand(command) }), queueId);
         }
 
-        // Rules kiro-cli doesn't load itself: fileMatch (active file) and #manual
+        // Editor context and rules are captured now — what the user was looking
+        // at when they typed — even if the message waits in the queue.
         const applied = this._rulesForMessage(text);
         if (applied.length) {
             this._postMessage({
@@ -376,10 +629,105 @@ export class ChatPanelProvider implements vscode.Disposable {
             });
         }
         const rulesBlock = formatRulesBlock(applied);
+        const enriched = this._buildContextEnrichedPrompt(text);
+        const withRules = (body: string) => (rulesBlock ? `${rulesBlock}\n\n${body}` : body);
 
-        const inSpec = this._specIsActive?.() === true && this._specBuildRevision !== null;
-        const body = inSpec ? this._specBuildRevision!(text) : this._buildContextEnrichedPrompt(text);
-        await this._sendPromptInternal(rulesBlock ? `${rulesBlock}\n\n${body}` : body, inSpec);
+        return this._enqueueTurn(() => {
+            // Spec revisions are built when the turn starts, against the latest draft
+            const inSpec = this._specIsActive?.() === true && this._specBuildRevision !== null;
+            return inSpec
+                ? { prompt: withRules(this._specBuildRevision!(text)), isSpecPrompt: true }
+                : { prompt: withRules(enriched), isSpecPrompt: false };
+        }, queueId);
+    }
+
+    /**
+     * Runs a slash command (as a queued turn, so it sees the session as left
+     * by earlier messages).
+     */
+    private async _runSlashCommand(command: string): Promise<void> {
+        let proc: CliProcess;
+        try {
+            proc = await this._cliManager.ensureProcess();
+            this._attachProcess(proc);
+        } catch (err) {
+            this._postMessage({ type: 'error', message: `Could not start kiro-cli: ${err instanceof Error ? err.message : String(err)}` });
+            return;
+        }
+        const advertised = proc.availableCommands ?? [];
+        const action = parseSlashCommand(command, advertised.map((c) => c.name));
+        if (!action) {
+            return;
+        }
+        const say = (message: string) => this._postMessage({ type: 'systemMessage', message });
+
+        switch (action.kind) {
+            case 'agentCommand':
+                await this._sendPromptInternal(action.text, false);
+                return;
+            case 'clear':
+                await this._clearAndStartNewSession();
+                return;
+            case 'help': {
+                const lines = BUILTIN_COMMANDS.map((c) => `${c.usage} — ${c.description}`);
+                if (advertised.length) {
+                    lines.push('', 'From kiro-cli:', ...advertised.map((c) => `/${c.name}${c.hint ? ` <${c.hint}>` : ''} — ${firstSentence(c.description)}`));
+                }
+                say(lines.join('\n'));
+                return;
+            }
+            case 'setOption': {
+                const option = proc.configOptions.find((o) => o.id === action.configId);
+                if (!option) {
+                    say(`kiro-cli doesn't offer a ${action.label.toLowerCase()} setting for this session${action.configId === 'effortLevel' ? ' (the current model may not support effort levels)' : ''}.`);
+                    return;
+                }
+                if (!action.value) {
+                    const current = option.options.find((o) => o.value === option.currentValue);
+                    say(`${action.label}: ${current?.name ?? option.currentValue}\nAvailable: ${option.options.map((o) => o.value).join(', ')}`);
+                    return;
+                }
+                const wanted = action.value.toLowerCase();
+                const choice = option.options.find((o) => o.value.toLowerCase() === wanted || o.name.toLowerCase() === wanted);
+                if (!choice) {
+                    say(`Unknown ${action.label.toLowerCase()} "${action.value}". Available: ${option.options.map((o) => o.value).join(', ')}`);
+                    return;
+                }
+                if (choice.value !== option.currentValue) {
+                    await this._handleModelSelection(action.configId, choice.value);
+                }
+                if (action.then) {
+                    await this._sendPromptInternal(this._buildContextEnrichedPrompt(action.then), false);
+                } else if (choice.value === option.currentValue) {
+                    say(`${action.label} is already ${choice.name}.`);
+                }
+                return;
+            }
+            case 'context':
+                say(`Context window: ${Math.round(this._contextUsage.total)}% used`);
+                return;
+            case 'compact':
+                if (!proc.hasExtensionMethod('_kiro/session/compact')) {
+                    say('This kiro-cli doesn\'t support /compact.');
+                    return;
+                }
+                this._postMessage({ type: 'loading', active: true });
+                try {
+                    await proc.request('_kiro/session/compact', { sessionId: proc.sessionId });
+                    say('Conversation compacted.');
+                } catch (err) {
+                    this._postMessage({ type: 'error', message: `Compact failed: ${err instanceof Error ? err.message : String(err)}` });
+                } finally {
+                    this._postMessage({ type: 'loading', active: false });
+                }
+                return;
+            case 'permissions':
+                await vscode.commands.executeCommand('kiro.openPermissions');
+                return;
+            case 'unknown':
+                say(`Unknown command /${action.name}. Type /help for the list.`);
+                return;
+        }
     }
 
     /** fileMatch rules matching the active file, plus manual rules referenced as #name. */
@@ -410,29 +758,17 @@ export class ChatPanelProvider implements vscode.Disposable {
      * Ensures the panel is open and ready before sending.
      */
     async handleSpecPrompt(prompt: string, phaseLabel: string): Promise<void> {
-        // Ensure panel is open
+        // openPanel() creates the panel synchronously, so it exists right after
         this.openPanel();
-
-        // Wait for panel to be ready
-        let retries = 10;
-        while (!this._panel && retries > 0) {
-            await new Promise<void>((r) => setTimeout(r, 100));
-            retries--;
-        }
-
-        if (!this._panel) {
-            vscode.window.showErrorMessage('Failed to open Kiro Chat panel.');
-            return;
-        }
-
         this._postMessage({ type: 'systemMessage', message: `Generating ${phaseLabel}...` });
-        await this._sendPromptInternal(prompt, true);
+        await this._enqueueTurn(() => ({ prompt, isSpecPrompt: true }));
     }
 
     /**
      * Disposes of the panel and all associated resources.
      */
     dispose(): void {
+        this._cancelPendingPermissions();
         this._panel?.dispose();
         this._panel = undefined;
 
@@ -492,16 +828,17 @@ export class ChatPanelProvider implements vscode.Disposable {
     private _onWebviewMessage(message: WebviewToExtMessage): void {
         switch (message.type) {
             case 'sendMessage':
-                this.handleUserMessage(message.text);
+                this.handleUserMessage(message.text, message.id);
                 break;
             case 'retry':
-                // Re-send the last failed message if available (Requirement 11.3)
-                if (this._lastFailedMessage !== null) {
-                    this.handleUserMessage(this._lastFailedMessage);
-                }
+                // Re-send the last failed prompt if available
+                this._retryLastFailed();
+                break;
+            case 'stop':
+                this._stop();
                 break;
             case 'selectModel':
-                // Handle model selection from the webview (Requirement 12.2)
+                // Handle model selection from the webview
                 this._handleModelSelection(message.configId, message.value);
                 break;
             case 'specAccept':
@@ -528,144 +865,34 @@ export class ChatPanelProvider implements vscode.Disposable {
             case 'changeWorkingDirectory':
                 vscode.commands.executeCommand('kiro.selectWorkingDirectory');
                 break;
-            case 'selectFiles':
-            case 'advanceSpec':
-                // Handled by other components (SpecWorkflowManager)
+            case 'permissionResponse':
+                this._answerPermission(message.requestId, message.optionId, message.scope);
                 break;
         }
     }
 
     /**
-     * Handles `_kiro.dev/metadata` notifications from the CLI.
-     * Parses contextUsagePercentage and sends it to the webview.
-     */
-    private _handleMetadataNotification(metadata: Record<string, unknown>): void {
-        const contextUsagePercentage = metadata.contextUsagePercentage as number | undefined;
-        if (contextUsagePercentage !== undefined) {
-            _log.appendLine(`[Chat] Metadata: contextUsagePercentage=${contextUsagePercentage}`);
-            this._contextUsage = {
-                ...this._contextUsage,
-                total: contextUsagePercentage,
-            };
-            this._postMessage({ type: 'contextUsage', usage: this._contextUsage });
-        }
-    }
-
-    /**
-     * Handles context_usage data from session/update notifications.
-     */
-    private _handleContextUsageUpdate(update: Record<string, unknown>): void {
-        const conversation = (update.conversation as number) ?? this._contextUsage.conversation;
-        const mcpTools = (update.mcpTools as number) ?? this._contextUsage.mcpTools;
-        const steeringFiles = (update.steeringFiles as number) ?? this._contextUsage.steeringFiles;
-        const total = (update.total as number) ?? this._contextUsage.total;
-
-        this._contextUsage = { conversation, mcpTools, steeringFiles, total };
-        this._postMessage({ type: 'contextUsage', usage: this._contextUsage });
-    }
-
-    /**
-     * Handles model selection from the webview.
-     * Tries ACP protocol first, falls back to kiro-cli settings command.
-     *
-     * Requirement 12.2, 12.3
+     * Changes an advertised session option (model, mode, effort) through
+     * `session/set_config_option`.
      */
     private async _handleModelSelection(configId: string, value: string): Promise<void> {
+        const label = configId === MODE_CONFIG_ID ? 'Mode' : configId === 'model' ? 'Model' : configId;
         try {
             const cliProcess = await this._cliManager.ensureProcess();
-
-            // Try ACP protocol first (session/set_model, session/set_mode, or set_config_option)
-            const label = configId === MODE_CONFIG_ID ? 'Agent' : 'Model';
-            try {
-                const updated = await cliProcess.setConfigOption(configId, value);
-                this._postMessage({ type: 'configOptions', options: updated });
-                this._postMessage({ type: 'systemMessage', message: `${label} changed to ${value}` });
-                return;
-            } catch (acpErr) {
-                _log.appendLine(`[Chat] ACP option change failed: ${acpErr}`);
-                if (configId === MODE_CONFIG_ID) {
-                    throw acpErr;
-                }
-            }
-
-            // Fallback for models only: change the CLI's default model (Requirement 12.3)
-            const cliPath = this._cliManager.resolvedCliPath;
-            if (cliPath) {
-                await this._setModelViaCli(cliPath, value);
-            } else {
-                this._postMessage({ type: 'error', message: 'CLI not found. Cannot change model.' });
-            }
+            const updated = await cliProcess.setConfigOption(configId, value);
+            this._postMessage({ type: 'configOptions', options: updated });
+            const option = updated.find((o) => o.id === configId);
+            const name = option?.options.find((o) => o.value === value)?.name ?? value;
+            this._postMessage({ type: 'systemMessage', message: `${label} changed to ${name}` });
         } catch (err) {
             const errorMessage = err instanceof Error ? err.message : 'Unknown error';
-            this._postMessage({ type: 'error', message: `Failed to change model: ${errorMessage}` });
-        }
-    }
-
-    /**
-     * Sets the model using kiro-cli settings command as a fallback.
-     */
-    private _setModelViaCli(cliPath: string, modelValue: string): Promise<void> {
-        return new Promise<void>((resolve) => {
-            const target = cliSpawnTarget(cliPath);
-            execFile(target.command, ['settings', 'chat.defaultModel', modelValue], { timeout: 10000, shell: target.shell, windowsHide: true }, (error: Error | null, _stdout: string, stderr: string) => {
-                if (error) {
-                    this._postMessage({ type: 'error', message: `Failed to change model: ${stderr || error.message}` });
-                } else {
-                    this._postMessage({ type: 'systemMessage', message: `Default model set to ${modelValue} (applies to new sessions)` });
-                }
-                resolve();
-            });
-        });
-    }
-
-    /**
-     * Parses config options from a session/update notification and sends them to the webview.
-     *
-     * Requirement 12.4
-     */
-    private _parseAndSendConfigOptions(update: Record<string, unknown>): void {
-        try {
-            const configOptions = update.configOptions as Array<Record<string, unknown>> | undefined;
-            if (!configOptions || !Array.isArray(configOptions)) {
-                return;
+            _log.appendLine(`[Chat] set_config_option ${configId} failed: ${errorMessage}`);
+            this._postMessage({ type: 'error', message: `Failed to change ${label.toLowerCase()}: ${errorMessage}` });
+            // Put the selector back to what kiro-cli actually uses
+            if (this._cliManager.state.status === 'running') {
+                this._postMessage({ type: 'configOptions', options: this._cliManager.state.process.configOptions });
             }
-
-            const options = configOptions.map((o) => {
-                const opts = (o.options as Array<Record<string, unknown>> || []).map((opt) => ({
-                    value: (opt.value as string) || '',
-                    name: (opt.name as string) || (opt.value as string) || '',
-                    description: (opt.description as string) || '',
-                }));
-                return {
-                    id: (o.id as string) || '',
-                    name: (o.name as string) || (o.id as string) || '',
-                    description: (o.description as string) || '',
-                    category: (o.category as string) || '',
-                    currentValue: (o.currentValue as string) || '',
-                    options: opts,
-                };
-            });
-
-            if (options.length > 0) {
-                this._postMessage({ type: 'configOptions', options });
-            }
-        } catch (err) {
-            _log.appendLine(`[Chat] Failed to parse config_options_update: ${err}`);
         }
-    }
-
-    /**
-     * Refreshes workspace files to detect changes made by the CLI agent.
-     *
-     * Requirement 13.1
-     */
-    private _refreshWorkspaceFiles(): void {
-        // Watch the directory the CLI actually works in (may differ from folders[0])
-        const cwd = this._cliManager.currentWorkingDirectory;
-        const pattern = new vscode.RelativePattern(vscode.Uri.file(cwd), '**/*');
-        const watcher = vscode.workspace.createFileSystemWatcher(pattern);
-        // Dispose shortly after — the creation itself triggers a scan
-        setTimeout(() => watcher.dispose(), 1000);
     }
 
     /**
@@ -697,6 +924,7 @@ export class ChatPanelProvider implements vscode.Disposable {
 
         const stylesUri = webview.asWebviewUri(vscode.Uri.joinPath(webviewDir, 'styles.css'));
         const scriptUri = webview.asWebviewUri(vscode.Uri.joinPath(webviewDir, 'main.js'));
+        const markdownUri = webview.asWebviewUri(vscode.Uri.joinPath(webviewDir, 'markdown.js'));
         const nonce = this._getNonce();
 
         const htmlPath = path.join(webviewFsPath, 'index.html');
@@ -704,6 +932,7 @@ export class ChatPanelProvider implements vscode.Disposable {
 
         html = html.replace(/\{\{stylesUri\}\}/g, stylesUri.toString());
         html = html.replace(/\{\{scriptUri\}\}/g, scriptUri.toString());
+        html = html.replace(/\{\{markdownUri\}\}/g, markdownUri.toString());
         html = html.replace(/\{\{nonce\}\}/g, nonce);
         html = html.replace(/\{\{cspSource\}\}/g, webview.cspSource);
 
@@ -711,14 +940,16 @@ export class ChatPanelProvider implements vscode.Disposable {
     }
 
     /**
-     * Generates a random nonce for the Content Security Policy.
+     * Generates a cryptographically random nonce for the Content Security Policy.
      */
     private _getNonce(): string {
-        const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
-        let nonce = '';
-        for (let i = 0; i < 32; i++) {
-            nonce += chars.charAt(Math.floor(Math.random() * chars.length));
-        }
-        return nonce;
+        return randomBytes(16).toString('base64');
     }
+}
+
+/** First sentence of a (possibly long) command description, for /help. */
+function firstSentence(text: string): string {
+    const m = /^[^.!?\n]*[.!?]?/.exec(text.trim());
+    const s = (m?.[0] ?? '').trim();
+    return s.length > 120 ? `${s.slice(0, 117)}…` : s;
 }

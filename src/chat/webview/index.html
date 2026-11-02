@@ -26,10 +26,7 @@
                         transform="rotate(-90 9 9)" />
                 </svg>
                 <div id="context-tooltip" class="context-tooltip">
-                    <div>Conversation: <span id="ctx-conversation">0</span>%</div>
-                    <div>MCP Tools: <span id="ctx-mcp">0</span>%</div>
-                    <div>Steering: <span id="ctx-steering">0</span>%</div>
-                    <div class="context-tooltip-total">Total: <span id="ctx-total">0</span>%</div>
+                    <div class="context-tooltip-total">Context used: <span id="ctx-total">0</span>%</div>
                 </div>
             </div>
             <div class="header-spacer"></div>
@@ -51,8 +48,14 @@
             <span class="loading-dot"></span>
         </div>
         <div id="spec-phase-bar" class="spec-phase-bar hidden"></div>
+        <div id="queued-messages" class="queued-messages hidden" aria-live="polite" aria-label="Queued messages"></div>
         <div class="input-area">
-            <textarea id="message-input" class="message-input" placeholder="Ask Kiro something… (/ for commands, #rule-name to apply a rule)" rows="1"></textarea>
+            <textarea id="message-input" class="message-input" aria-label="Message Kiro" rows="1"></textarea>
+            <button id="stop-btn" class="stop-btn hidden" type="button" title="Stop Kiro (Esc)" aria-label="Stop Kiro">
+                <svg width="12" height="12" viewBox="0 0 12 12" fill="currentColor" aria-hidden="true">
+                    <rect x="1" y="1" width="10" height="10" rx="1.5" />
+                </svg>
+            </button>
             <button id="send-btn" class="send-btn" title="Send message">
                 <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor">
                     <path d="M1 1.5L15 8L1 14.5V9.5L10 8L1 6.5V1.5Z" />
@@ -60,6 +63,7 @@
             </button>
         </div>
     </div>
+    <script nonce="{{nonce}}" src="{{markdownUri}}"></script>
     <script nonce="{{nonce}}" src="{{scriptUri}}"></script>
 </body>
 

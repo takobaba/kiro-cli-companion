@@ -60,6 +60,44 @@ suite('CommandRegistry', () => {
             registry.dispose();
         });
 
+        test('selectWorkingDirectory refuses to change the folder once the conversation started', async () => {
+            Object.defineProperty(chatPanelProvider, 'isWorkingDirectoryLocked', { value: true });
+            const pick = sandbox.stub(cliManager, 'selectWorkingDirectory').resolves('/elsewhere');
+            const info = sandbox.stub(vscode.window, 'showInformationMessage').resolves();
+            const registry = new CommandRegistry(
+                cliManager,
+                chatPanelProvider as unknown as ChatPanelProvider,
+                specWorkflowManager as unknown as SpecWorkflowManager
+            );
+            registry.registerCommands();
+            const handler = registerCommandStub.getCalls()
+                .find((c: sinon.SinonSpyCall) => c.args[0] === 'kiro.selectWorkingDirectory')!.args[1];
+
+            await handler();
+
+            assert.ok(pick.notCalled, 'folder picker must not open');
+            assert.ok(/Clear the chat/.test(info.firstCall.args[0] as string), 'user is told how to change it');
+            registry.dispose();
+        });
+
+        test('selectWorkingDirectory opens the picker before the conversation starts', async () => {
+            Object.defineProperty(chatPanelProvider, 'isWorkingDirectoryLocked', { value: false });
+            const pick = sandbox.stub(cliManager, 'selectWorkingDirectory').resolves(undefined);
+            const registry = new CommandRegistry(
+                cliManager,
+                chatPanelProvider as unknown as ChatPanelProvider,
+                specWorkflowManager as unknown as SpecWorkflowManager
+            );
+            registry.registerCommands();
+            const handler = registerCommandStub.getCalls()
+                .find((c: sinon.SinonSpyCall) => c.args[0] === 'kiro.selectWorkingDirectory')!.args[1];
+
+            await handler();
+
+            assert.ok(pick.calledOnce);
+            registry.dispose();
+        });
+
         test('returns disposable array', () => {
             const registry = new CommandRegistry(
                 cliManager,

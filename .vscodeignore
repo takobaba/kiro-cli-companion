@@ -17,9 +17,9 @@ eslint.config.mjs
 **/.eslintrc.json
 **/*.map
 **/*.ts
-**/*.map
 .vscode-test.mjs
 package-lock.json
 *.vsix
+test-fixtures/**
 # Source for icon.png; not needed at runtime
 resources/icon.svg

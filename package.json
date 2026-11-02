@@ -75,6 +75,11 @@
                 "icon": "$(folder-opened)"
             },
             {
+                "command": "kiro.openPermissions",
+                "title": "Kiro: Open Permissions",
+                "icon": "$(shield)"
+            },
+            {
                 "command": "kiro.refreshOverview",
                 "title": "Kiro: Refresh",
                 "icon": "$(refresh)"
@@ -123,7 +128,7 @@
         "viewsWelcome": [
             {
                 "view": "kiro.launcher",
-                "contents": "Chat with the Kiro CLI in a panel beside your code.\n[Open Chat](command:kiro.openChat)\nPlan a feature before coding: Kiro writes the requirements, a design and a task list, and you review each step.\n[Plan a Feature (Spec)](command:kiro.startSpec)\nRules tell Kiro your conventions (coding style, testing, …). See them under \"What Kiro Uses\" below.\n[New Rule](command:kiro.newRule)\n[Open Rules Folder](command:kiro.openRulesFolder)\nChoose the folder kiro-cli runs in, or restart it if it stops responding.\n[Select Working Directory](command:kiro.selectWorkingDirectory)\n[Restart CLI](command:kiro.restartCli)\nNot signed in? [Log in](command:kiro.login) or [use an API key](command:kiro.setApiKey)."
+                "contents": "[Open Chat](command:kiro.openChat)\nPlan before you develop!\n[Spec](command:kiro.startSpec)\nRules tell Kiro how to work and develop.\n[New Rule](command:kiro.newRule)\nSet it once!\n[Select Working Directory](command:kiro.selectWorkingDirectory)\n[Restart CLI](command:kiro.restartCli)\nNot signed in? [Log in](command:kiro.login) or [use an API key](command:kiro.setApiKey)."
             }
         ],
         "menus": {
@@ -158,6 +163,11 @@
                 {
                     "command": "kiro.startSpec",
                     "when": "view == kiro.overview && viewItem == kiroGroup.specs",
+                    "group": "inline"
+                },
+                {
+                    "command": "kiro.openPermissions",
+                    "when": "view == kiro.overview && viewItem == kiroGroup.permissions",
                     "group": "inline"
                 }
             ],

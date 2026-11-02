@@ -4,8 +4,6 @@
  * Handles message exchange with the extension host via postMessage,
  * renders markdown content with syntax-highlighted code blocks and copy buttons,
  * manages model selection, tool status display, system messages, and chat UI state.
- *
- * Requirements: 4.2–4.8, 11.1, 12.1–12.5
  */
 
 (function () {
@@ -18,6 +16,7 @@
     const specPhaseBar = document.getElementById('spec-phase-bar');
     const inputEl = document.getElementById('message-input');
     const sendBtn = document.getElementById('send-btn');
+    const stopBtn = document.getElementById('stop-btn');
     const modelSelector = document.getElementById('model-selector');
     const clearChatBtn = document.getElementById('clear-chat-btn');
     const contextRing = document.getElementById('context-ring');
@@ -26,6 +25,10 @@
     const cwdIndicator = document.getElementById('cwd-indicator');
     const cwdPathEl = document.getElementById('cwd-path');
     const cwdStatusEl = document.getElementById('cwd-status');
+    const queuedEl = document.getElementById('queued-messages');
+
+    /** @type {number} Counter for user message IDs (used to track queued bubbles) */
+    let nextMessageId = 0;
 
     /** @type {HTMLDivElement|null} Current assistant message element being streamed into */
     let currentAssistantMsg = null;
@@ -49,8 +52,9 @@
         if (!text) {
             return;
         }
-        appendUserMessage(text);
-        vscode.postMessage({ type: 'sendMessage', text: text });
+        var id = 'msg-' + (++nextMessageId);
+        appendUserMessage(text, id);
+        vscode.postMessage({ type: 'sendMessage', text: text, id: id });
         inputEl.value = '';
         autoResizeInput();
     }
@@ -60,6 +64,23 @@
      */
     function sendRetry() {
         vscode.postMessage({ type: 'retry' });
+    }
+
+    /** True while Kiro is working on a turn (the Stop button is visible). */
+    var isWorking = false;
+
+    /**
+     * Asks the extension host to stop the running turn.
+     */
+    function sendStop() {
+        if (!isWorking) {
+            return;
+        }
+        vscode.postMessage({ type: 'stop' });
+    }
+
+    if (stopBtn) {
+        stopBtn.addEventListener('click', sendStop);
     }
 
     // ---- Clear Chat Button ----
@@ -86,16 +107,13 @@
                 handleResponse(msg.content, msg.done);
                 break;
             case 'toolStatus':
-                handleToolStatus(msg.title, msg.status, msg.kind);
+                handleToolStatus(msg.title, msg.status, msg.kind, msg.toolCallId);
                 break;
             case 'error':
                 handleError(msg.message);
                 break;
             case 'loading':
                 handleLoading(msg.active);
-                break;
-            case 'specPhase':
-                handleSpecPhase(msg.phase, msg.phaseIndex);
                 break;
             case 'specPhaseBar':
                 handleSpecPhaseBar(msg.phase, msg.phaseIndex, msg.phases);
@@ -115,12 +133,206 @@
             case 'sessionInfo':
                 handleSessionInfo(msg.info);
                 break;
+            case 'messageQueued':
+                handleMessageQueued(msg.id);
+                break;
+            case 'messageDequeued':
+                handleMessageDequeued(msg.id);
+                break;
+            case 'messageDropped':
+                handleMessageDropped(msg.id);
+                break;
+            case 'permissionRequest':
+                handlePermissionRequest(msg.request);
+                break;
+            case 'permissionResolved':
+                handlePermissionResolved(msg.requestId, msg.label);
+                break;
         }
     });
 
+    // ---- Tool Permissions ----
+    // kiro-cli asks before running tools its rules don't allow. Only the
+    // options it offered are shown. "Always" choices are saved as a rule in
+    // the scope picked here (workspace, all projects, or this session).
+
+    var SCOPE_LABELS = { workspace: 'this workspace', user: 'all projects', session: 'this session' };
+    var CAPABILITY_LABELS = {
+        shell: 'run a command', fs_write: 'write files', fs_read: 'read files', web_fetch: 'fetch a web page',
+        web_search: 'search the web', mcp: 'use an MCP tool', subagent: 'start a sub-agent'
+    };
+
+    /**
+     * @param {{requestId: string, title: string, capability?: string, resource?: string,
+     *          options: Array<{optionId: string, name: string, kind: string}>, scopes: string[]}} request
+     */
+    function handlePermissionRequest(request) {
+        // Finish the text streamed so far so the card appears after it
+        if (currentAssistantMsg && streamBuffer) {
+            currentAssistantMsg.innerHTML = renderMarkdown(streamBuffer);
+            addCopyButtons(currentAssistantMsg);
+        }
+        currentAssistantMsg = null;
+        streamBuffer = '';
+
+        var card = document.createElement('div');
+        card.className = 'permission-card';
+        card.setAttribute('data-request-id', request.requestId);
+        card.setAttribute('role', 'group');
+        card.setAttribute('aria-label', 'Permission request');
+
+        var heading = document.createElement('div');
+        heading.className = 'permission-heading';
+        var action = request.capability && CAPABILITY_LABELS[request.capability];
+        heading.textContent = 'Kiro wants to ' + (action || ('use ' + (request.capability || 'a tool')));
+        card.appendChild(heading);
+
+        var detail = document.createElement('code');
+        detail.className = 'permission-resource';
+        detail.textContent = request.resource || request.title;
+        card.appendChild(detail);
+
+        var hasAlways = request.options.some(function (o) { return o.kind === 'allow_always' || o.kind === 'reject_always'; });
+        var scopeSelect = null;
+        if (hasAlways && request.scopes && request.scopes.length) {
+            var scopeRow = document.createElement('label');
+            scopeRow.className = 'permission-scope';
+            scopeRow.textContent = '"Always" applies to ';
+            scopeSelect = document.createElement('select');
+            scopeSelect.setAttribute('aria-label', 'Where to save an always choice');
+            request.scopes.forEach(function (s) {
+                var opt = document.createElement('option');
+                opt.value = s;
+                opt.textContent = SCOPE_LABELS[s] || s;
+                scopeSelect.appendChild(opt);
+            });
+            scopeRow.appendChild(scopeSelect);
+            card.appendChild(scopeRow);
+        }
+
+        var buttons = document.createElement('div');
+        buttons.className = 'permission-actions';
+        request.options.forEach(function (option) {
+            var btn = document.createElement('button');
+            btn.type = 'button';
+            btn.textContent = option.name;
+            btn.className = 'permission-btn ' + (option.kind.indexOf('allow') === 0 ? 'allow' : 'reject');
+            btn.addEventListener('click', function () {
+                var isAlways = option.kind === 'allow_always' || option.kind === 'reject_always';
+                buttons.querySelectorAll('button').forEach(function (b) { b.disabled = true; });
+                if (scopeSelect) { scopeSelect.disabled = true; }
+                vscode.postMessage({
+                    type: 'permissionResponse',
+                    requestId: request.requestId,
+                    optionId: option.optionId,
+                    scope: isAlways && scopeSelect ? scopeSelect.value : undefined
+                });
+            });
+            buttons.appendChild(btn);
+        });
+        card.appendChild(buttons);
+
+        messagesEl.appendChild(card);
+        scrollToBottom();
+        var first = buttons.querySelector('button');
+        if (first) { first.focus(); }
+    }
+
+    /** @param {string} requestId @param {string} label */
+    function handlePermissionResolved(requestId, label) {
+        var card = document.querySelector('.permission-card[data-request-id="' + requestId + '"]');
+        if (!card) {
+            return;
+        }
+        card.classList.add('resolved');
+        var actions = card.querySelector('.permission-actions');
+        if (actions) { actions.remove(); }
+        var scope = card.querySelector('.permission-scope');
+        if (scope) { scope.remove(); }
+        var result = document.createElement('div');
+        result.className = 'permission-result';
+        result.textContent = label;
+        card.appendChild(result);
+    }
+
+    // ---- Message Queue ----
+    // Like kiro-cli, messages sent while Kiro is working wait for the current
+    // turn. They sit above the input until sent, then join the transcript.
+
+    /** @param {string} id */
+    function findUserMessage(id) {
+        return document.querySelector('.message.user[data-msg-id="' + id + '"]');
+    }
+
+    /** @param {HTMLElement} el @param {string|null} text */
+    function setMessageNote(el, text) {
+        var note = el.querySelector('.message-note');
+        if (!text) {
+            if (note) { note.remove(); }
+            return;
+        }
+        if (!note) {
+            note = document.createElement('span');
+            note.className = 'message-note';
+            el.appendChild(note);
+        }
+        note.textContent = text;
+    }
+
+    function updateQueueVisibility() {
+        if (queuedEl) {
+            queuedEl.classList.toggle('hidden', queuedEl.children.length === 0);
+        }
+    }
+
+    /** @param {string} id */
+    function handleMessageQueued(id) {
+        var el = findUserMessage(id);
+        if (!el || !queuedEl) {
+            return;
+        }
+        el.classList.add('queued');
+        setMessageNote(el, 'Queued — sends when Kiro finishes');
+        queuedEl.appendChild(el);
+        updateQueueVisibility();
+    }
+
+    /** @param {string} id */
+    function handleMessageDequeued(id) {
+        var el = findUserMessage(id);
+        if (!el) {
+            return;
+        }
+        el.classList.remove('queued');
+        setMessageNote(el, null);
+        messagesEl.appendChild(el);
+        updateQueueVisibility();
+        scrollToBottom();
+    }
+
+    /** @param {string} id */
+    function handleMessageDropped(id) {
+        var el = findUserMessage(id);
+        if (!el) {
+            return;
+        }
+        el.classList.remove('queued');
+        el.classList.add('not-sent');
+        setMessageNote(el, 'Not sent');
+        messagesEl.appendChild(el);
+        updateQueueVisibility();
+        scrollToBottom();
+    }
+
     // ---- Working Directory Indicator ----
+    /** True once the conversation started: the folder is fixed until the chat is cleared. */
+    var cwdLocked = false;
+    var cwdChangeEl = document.getElementById('cwd-change');
     if (cwdIndicator) {
         cwdIndicator.addEventListener('click', function () {
+            if (cwdLocked) {
+                return;
+            }
             vscode.postMessage({ type: 'changeWorkingDirectory' });
         });
     }
@@ -128,23 +340,31 @@
     /**
      * Shows which directory kiro-cli runs in and how it was started.
      * @param {{cwd: string, cwdSource: string, cliPath: string|null, cliSource: string|null,
-     *          running: boolean, sessionId: string|null, multiRoot: boolean}} info
+     *          running: boolean, sessionId: string|null, multiRoot: boolean, locked?: boolean}} info
      */
     function handleSessionInfo(info) {
         if (!cwdIndicator || !cwdPathEl || !cwdStatusEl) {
             return;
         }
+        cwdLocked = !!info.locked;
         cwdPathEl.textContent = info.cwd;
         cwdStatusEl.className = 'cwd-status' + (info.running ? ' running' : '');
+        cwdIndicator.classList.toggle('locked', cwdLocked);
+        cwdIndicator.setAttribute('aria-disabled', cwdLocked ? 'true' : 'false');
+        if (cwdChangeEl) {
+            cwdChangeEl.textContent = cwdLocked ? '🔒' : 'Change';
+        }
         var lines = [
             'kiro-cli working directory: ' + info.cwd,
             'Chosen from: ' + info.cwdSource,
             'Status: ' + (info.running ? 'running (session ' + (info.sessionId || '?') + ')' : 'not started — starts with your first message'),
             'CLI: ' + (info.cliPath ? info.cliPath + ' (found via ' + (info.cliSource || 'unknown') + ')' : 'not found'),
-            'Command: kiro-cli acp',
+            'Command: kiro-cli acp --agent-engine=v3',
             '',
             'kiro-cli reads .kiro/ (steering, specs, agents) and runs tools relative to this directory.',
-            'Click to change' + (info.multiRoot ? ' (multi-root workspace)' : '') + '.'
+            cwdLocked
+                ? 'Fixed for this conversation. Clear the chat (🗑) to start a new one in another folder.'
+                : 'Click to change' + (info.multiRoot ? ' (multi-root workspace)' : '') + '. It is fixed once you send a message.'
         ];
         cwdIndicator.title = lines.join('\n');
     }
@@ -170,7 +390,7 @@
         currentAssistantMsg.innerHTML = renderMarkdown(streamBuffer);
 
         if (done) {
-            // Add copy buttons to code blocks (Requirement 4.4)
+            // Add copy buttons to code blocks
             addCopyButtons(currentAssistantMsg);
             currentAssistantMsg = null;
             streamBuffer = '';
@@ -180,39 +400,27 @@
     }
 
     /**
-     * Handles a tool status update from the extension host.
-     * Shows tool activity as a separate compact element between text chunks.
-     * Requirement 4.6
+     * Handles a tool status update from the extension host. Tool calls are
+     * not rendered; this only keeps the surrounding text readable.
      * @param {string} title
      * @param {string} status
      * @param {string} kind
+     * @param {string} [toolCallId] Same ID for a call and its updates
      */
-    function handleToolStatus(title, status, kind) {
-        // Finalize current assistant message so tool status appears separately
-        if (currentAssistantMsg && streamBuffer) {
-            currentAssistantMsg.innerHTML = renderMarkdown(streamBuffer);
-            addCopyButtons(currentAssistantMsg);
-            currentAssistantMsg = null;
-            streamBuffer = '';
-        }
-
-        // Skip generic entries (e.g. just "read" or "write")
-        if (status === 'in_progress' && (title === 'read' || title === 'write' || title === 'shell')) {
+    function handleToolStatus(title, status, kind, toolCallId) {
+        // Tool activity (reading, searching, …) isn't shown; the "Thinking"
+        // indicator covers the whole turn. A new tool call only starts a new
+        // paragraph, so text streamed before and after it doesn't run together.
+        if (!title || status === 'completed' || status === 'failed') {
             return;
         }
-
-        var icon = status === 'completed' ? '✓' : '⏳';
-        var el = document.createElement('div');
-        el.className = 'tool-status' + (status === 'completed' ? ' completed' : '');
-        el.textContent = icon + ' ' + title;
-        messagesEl.appendChild(el);
-
-        scrollToBottom();
+        if (currentAssistantMsg && streamBuffer && !/\n\n$/.test(streamBuffer)) {
+            streamBuffer += '\n\n';
+        }
     }
 
     /**
      * Displays an error message with a red label and retry button.
-     * Requirement 11.1
      * @param {string} message
      */
     function handleError(message) {
@@ -240,10 +448,13 @@
 
     /**
      * Shows or hides the animated loading indicator.
-     * Requirement 4.5
      * @param {boolean} active
      */
     function handleLoading(active) {
+        isWorking = !!active;
+        if (stopBtn) {
+            stopBtn.classList.toggle('hidden', !active);
+        }
         if (loadingEl) {
             if (active) {
                 loadingEl.classList.remove('hidden');
@@ -252,25 +463,6 @@
             }
         }
         scrollToBottom();
-    }
-
-    /**
-     * Displays the spec phase indicator bar (legacy simple version).
-     * @param {string} phase
-     * @param {number} phaseIndex
-     */
-    function handleSpecPhase(phase, phaseIndex) {
-        if (!specPhaseBar) {
-            return;
-        }
-        var phases = ['requirements', 'design', 'tasks'];
-        specPhaseBar.classList.remove('hidden');
-        specPhaseBar.innerHTML = phases
-            .map(function (p, i) {
-                var cls = 'spec-phase' + (i === phaseIndex ? ' active' : '');
-                return '<span class="' + cls + '">' + escapeHtml(p) + '</span>';
-            })
-            .join('');
     }
 
     /**
@@ -352,7 +544,6 @@
 
     /**
      * Displays a system message with muted styling.
-     * Requirement 4.7
      * @param {string} message
      */
     function handleSystemMessage(message) {
@@ -365,7 +556,6 @@
 
     /**
      * Updates the model and agent selectors from config options.
-     * Requirement 12.1, 12.4
      * @param {Array} options
      */
     function handleConfigOptions(options) {
@@ -416,6 +606,10 @@
      */
     function handleClearChat() {
         messagesEl.innerHTML = '';
+        if (queuedEl) {
+            queuedEl.innerHTML = '';
+            updateQueueVisibility();
+        }
         currentAssistantMsg = null;
         streamBuffer = '';
     }
@@ -450,16 +644,9 @@
         contextRing.setAttribute('stroke', color);
 
         // Update tooltip text
-        contextUsageEl.title = 'Context usage: ' + Math.round(total) + '%';
+        contextUsageEl.title = 'Context used: ' + Math.round(total) + '%';
 
-        var ctxConversation = document.getElementById('ctx-conversation');
-        var ctxMcp = document.getElementById('ctx-mcp');
-        var ctxSteering = document.getElementById('ctx-steering');
         var ctxTotal = document.getElementById('ctx-total');
-
-        if (ctxConversation) { ctxConversation.textContent = Math.round(usage.conversation || 0); }
-        if (ctxMcp) { ctxMcp.textContent = Math.round(usage.mcpTools || 0); }
-        if (ctxSteering) { ctxSteering.textContent = Math.round(usage.steeringFiles || 0); }
         if (ctxTotal) { ctxTotal.textContent = Math.round(total); }
     }
 
@@ -493,10 +680,14 @@
     /**
      * Appends a user message bubble to the chat.
      * @param {string} text
+     * @param {string} [id] Tracks the bubble if the message gets queued
      */
-    function appendUserMessage(text) {
+    function appendUserMessage(text, id) {
         var el = createMessageEl('user');
         el.textContent = text;
+        if (id) {
+            el.setAttribute('data-msg-id', id);
+        }
         scrollToBottom();
     }
 
@@ -514,7 +705,6 @@
 
     /**
      * Adds copy-to-clipboard buttons to all code blocks in a message element.
-     * Requirement 4.4
      * @param {HTMLElement} messageEl
      */
     function addCopyButtons(messageEl) {
@@ -575,6 +765,14 @@
         }
     });
 
+    // Esc anywhere in the chat stops Kiro while it's working
+    document.addEventListener('keydown', function (e) {
+        if (e.key === 'Escape' && isWorking) {
+            e.preventDefault();
+            sendStop();
+        }
+    });
+
     inputEl.addEventListener('input', autoResizeInput);
 
     sendBtn.addEventListener('click', sendMessage);
@@ -584,179 +782,10 @@
         inputEl.style.height = Math.min(inputEl.scrollHeight, 120) + 'px';
     }
 
-    // ---- Markdown Renderer ----
+    // ---- Markdown Renderer (markdown.js, loaded first) ----
 
-    /**
-     * Lightweight inline markdown renderer.
-     * Handles: code blocks with language tags, inline code, bold, italic,
-     * links, unordered/ordered lists, and paragraphs.
-     *
-     * @param {string} text
-     * @returns {string} HTML string
-     */
-    function renderMarkdown(text) {
-        // Normalize line endings
-        var src = text.replace(/\r\n/g, '\n');
-
-        var html = '';
-        var lines = src.split('\n');
-        var i = 0;
-
-        while (i < lines.length) {
-            var line = lines[i];
-
-            // Fenced code block
-            var codeMatch = line.match(/^```(\w*)/);
-            if (codeMatch) {
-                var lang = codeMatch[1] || '';
-                var codeLines = [];
-                i++;
-                while (i < lines.length && !lines[i].match(/^```\s*$/)) {
-                    codeLines.push(lines[i]);
-                    i++;
-                }
-                i++; // skip closing ```
-                var codeContent = codeLines.join('\n');
-                var header = lang
-                    ? '<div class="code-block-header"><span class="code-lang">' + escapeHtml(lang) + '</span></div>'
-                    : '<div class="code-block-header"></div>';
-                html += '<pre>' + header + '<code>' + highlightCode(escapeHtml(codeContent), lang) + '</code></pre>';
-                continue;
-            }
-
-            // Unordered list item
-            if (line.match(/^\s*[-*+]\s+/)) {
-                html += '<ul>';
-                while (i < lines.length && lines[i].match(/^\s*[-*+]\s+/)) {
-                    var itemText = lines[i].replace(/^\s*[-*+]\s+/, '');
-                    html += '<li>' + renderInline(itemText) + '</li>';
-                    i++;
-                }
-                html += '</ul>';
-                continue;
-            }
-
-            // Ordered list item
-            if (line.match(/^\s*\d+\.\s+/)) {
-                html += '<ol>';
-                while (i < lines.length && lines[i].match(/^\s*\d+\.\s+/)) {
-                    var olText = lines[i].replace(/^\s*\d+\.\s+/, '');
-                    html += '<li>' + renderInline(olText) + '</li>';
-                    i++;
-                }
-                html += '</ol>';
-                continue;
-            }
-
-            // Blank line — skip
-            if (line.trim() === '') {
-                i++;
-                continue;
-            }
-
-            // Heading
-            var headingMatch = line.match(/^(#{1,6})\s+(.*)/);
-            if (headingMatch) {
-                var level = headingMatch[1].length;
-                html += '<h' + level + '>' + renderInline(headingMatch[2]) + '</h' + level + '>';
-                i++;
-                continue;
-            }
-
-            // Default: paragraph (collect consecutive non-blank, non-special lines)
-            var paraLines = [];
-            while (
-                i < lines.length &&
-                lines[i].trim() !== '' &&
-                !lines[i].match(/^```/) &&
-                !lines[i].match(/^\s*[-*+]\s+/) &&
-                !lines[i].match(/^\s*\d+\.\s+/) &&
-                !lines[i].match(/^#{1,6}\s+/)
-            ) {
-                paraLines.push(lines[i]);
-                i++;
-            }
-            html += '<p>' + renderInline(paraLines.join('\n')) + '</p>';
-        }
-
-        return html;
-    }
-
-    /**
-     * Renders inline markdown: bold, italic, inline code, links.
-     * @param {string} text
-     * @returns {string}
-     */
-    function renderInline(text) {
-        // Inline code (must come first to avoid processing inside code spans)
-        text = text.replace(/`([^`]+)`/g, '<code>$1</code>');
-        // Bold
-        text = text.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
-        text = text.replace(/__(.+?)__/g, '<strong>$1</strong>');
-        // Italic
-        text = text.replace(/\*(.+?)\*/g, '<em>$1</em>');
-        text = text.replace(/_(.+?)_/g, '<em>$1</em>');
-        // Links
-        text = text.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank">$1</a>');
-        // Line breaks
-        text = text.replace(/\n/g, '<br>');
-        return text;
-    }
-
-    /**
-     * Basic syntax highlighting for code blocks using CSS classes.
-     * @param {string} code Already HTML-escaped code
-     * @param {string} lang Language identifier
-     * @returns {string}
-     */
-    function highlightCode(code, lang) {
-        if (!lang) {
-            return code;
-        }
-
-        // Comments: // ... and /* ... */
-        code = code.replace(/(\/\/[^\n]*)/g, '<span class="token-comment">$1</span>');
-        code = code.replace(/(\/\*[\s\S]*?\*\/)/g, '<span class="token-comment">$1</span>');
-        // Strings: double-quoted and single-quoted
-        code = code.replace(
-            /(&quot;(?:[^&]|&(?!quot;))*?&quot;)/g,
-            '<span class="token-string">$1</span>'
-        );
-        code = code.replace(
-            /(&#x27;(?:[^&]|&(?!#x27;))*?&#x27;)/g,
-            '<span class="token-string">$1</span>'
-        );
-        code = code.replace(
-            /('(?:[^'\\]|\\.)*')/g,
-            '<span class="token-string">$1</span>'
-        );
-        // Numbers
-        code = code.replace(/\b(\d+\.?\d*)\b/g, '<span class="token-number">$1</span>');
-        // Keywords (common across JS/TS/Python/Java/C)
-        var keywords =
-            '\\b(const|let|var|function|return|if|else|for|while|do|switch|case|break|continue|' +
-            'class|extends|implements|interface|type|enum|import|export|from|default|new|this|' +
-            'try|catch|finally|throw|async|await|yield|of|in|typeof|instanceof|void|null|undefined|' +
-            'true|false|def|self|print|elif|except|raise|with|as|pass|lambda|None|True|False|' +
-            'public|private|protected|static|final|abstract|override|readonly|declare)\\b';
-        code = code.replace(new RegExp(keywords, 'g'), '<span class="token-keyword">$1</span>');
-
-        return code;
-    }
-
-    /**
-     * Escapes HTML special characters.
-     * @param {string} str
-     * @returns {string}
-     */
-    function escapeHtml(str) {
-        return str
-            .replace(/&/g, '&amp;')
-            .replace(/</g, '&lt;')
-            .replace(/>/g, '&gt;')
-            .replace(/"/g, '&quot;')
-            .replace(/'/g, '&#x27;');
-    }
+    var renderMarkdown = window.KiroMarkdown.renderMarkdown;
+    var escapeHtml = window.KiroMarkdown.escapeHtml;
 
     // Tell the extension host we're listening so it can send session info
     vscode.postMessage({ type: 'ready' });

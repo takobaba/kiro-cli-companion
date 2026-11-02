@@ -154,6 +154,15 @@ export class CommandRegistry implements vscode.Disposable {
      * (starting a fresh session) if it's running somewhere else.
      */
     private async _handleSelectWorkingDirectory(): Promise<void> {
+        // The folder is chosen once per conversation: kiro-cli's session,
+        // history and file edits all belong to the directory it started in.
+        if (this._chatPanelProvider.isWorkingDirectoryLocked) {
+            vscode.window.showInformationMessage(
+                `kiro-cli is working in ${this._cliManager.currentWorkingDirectory} for this conversation. ` +
+                'Clear the chat (🗑) to start a new conversation in another folder.'
+            );
+            return;
+        }
         try {
             const wasRunning = this._cliManager.state.status === 'running';
             const dir = await this._cliManager.selectWorkingDirectory();

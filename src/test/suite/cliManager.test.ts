@@ -100,7 +100,7 @@ suite('CliManager', function () {
             assert.strictEqual(chunks.join(''), 'echo: hello');
             assert.deepStrictEqual(
                 proc.configOptions.map((o) => `${o.category}:${o.currentValue}`),
-                ['model:auto', 'mode:kiro_default']
+                ['mode:vibe', 'model:auto']
             );
             manager.dispose();
         });

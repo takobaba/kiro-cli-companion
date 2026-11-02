@@ -9,10 +9,11 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { CliManager } from '../cli/cliManager';
 import { getHomeDir } from '../cli/cliLocator';
+import { PermissionsFile, permissionsTemplate, readPermissionFiles } from '../permissions/permissions';
 import { Rule, RuleInclusion, describeInclusion, globalRulesDir, listRulesIn, newRuleTemplate, projectRulesDir } from '../rules/rules';
 import { KiroConfig, Scope, readKiroConfig } from './kiroConfig';
 
-type GroupId = 'rules' | 'specs' | 'agents' | 'skills' | 'mcp';
+type GroupId = 'rules' | 'specs' | 'agents' | 'skills' | 'mcp' | 'permissions';
 
 interface Node {
     item: vscode.TreeItem;
@@ -87,30 +88,89 @@ export class KiroOverviewProvider implements vscode.TreeDataProvider<Node>, vsco
         return [
             this._group('rules', 'Rules', 'law', config.rules.length, () => this._ruleNodes(config)),
             this._group('specs', 'Specs', 'checklist', config.specs.length, () => this._specNodes(config)),
+            this._permissionsGroup(),
             this._group('agents', 'Custom Agents', 'person', config.agents.length, () =>
                 config.agents.length
                     ? config.agents.map((a) => fileNode(a.name, a.filePath, scopeLabel(a.scope), 'person', a.description || a.filePath))
-                    : [hintNode('None — kiro-cli uses its built-in agents', 'Custom agents are JSON files in .kiro/agents/ or ~/.kiro/agents/. Create one with "/agent create <name>" in the chat.')]
+                    : [hintNode('None', 'Create one with /agent create <name>')]
             ),
             this._group('skills', 'Skills', 'tools', config.skills.length, () =>
                 config.skills.length
                     ? config.skills.map((s) => fileNode(s.name, s.filePath, scopeLabel(s.scope), 'tools', s.description || s.filePath))
-                    : [hintNode('None', 'Skills are folders with a SKILL.md in .kiro/skills/ or ~/.kiro/skills/.')]
+                    : [hintNode('None', '.kiro/skills/<name>/SKILL.md')]
             ),
             this._group('mcp', 'MCP Servers', 'plug', config.mcpServers.length, () =>
                 config.mcpServers.length
                     ? config.mcpServers.map((m) =>
                         fileNode(m.name, m.configPath, `${scopeLabel(m.scope)}${m.disabled ? ' · disabled' : ''}`, m.disabled ? 'debug-disconnect' : 'plug', `${m.detail || m.name}\n${m.configPath}`)
                     )
-                    : [hintNode('None', 'MCP servers are defined in .kiro/settings/mcp.json or ~/.kiro/settings/mcp.json. Add one with "/mcp add" in the chat.')]
+                    : [hintNode('None', 'Add one with /mcp add')]
             ),
         ];
+    }
+
+    /** V3 permission files that apply to the CLI's working directory. */
+    getPermissionFiles(): PermissionsFile[] {
+        return readPermissionFiles(getHomeDir(), this._cliManager.currentWorkingDirectory);
+    }
+
+    private _permissionsGroup(): Node {
+        const files = this.getPermissionFiles();
+        const rules = files.reduce((n, f) => n + f.ruleCount, 0);
+        const group = this._group('permissions', 'Permissions', 'shield', rules, () =>
+            files.map((f) => {
+                const label = f.scope === 'workspace' ? 'This workspace' : 'All projects';
+                if (!f.exists) {
+                    return hintNode(`${label}: create…`, f.filePath, {
+                        command: 'kiro.openPermissions',
+                        title: 'Create Permissions File',
+                        arguments: [f.scope],
+                    });
+                }
+                const parts = [`${f.ruleCount} rule${f.ruleCount === 1 ? '' : 's'}`, ...f.policies];
+                return fileNode(label, f.filePath, parts.join(' · '), f.scope === 'workspace' ? 'folder' : 'globe', f.filePath);
+            })
+        );
+        group.item.tooltip = 'Tool rules for kiro-cli. Deny wins over allow.';
+        return group;
+    }
+
+    /**
+     * Opens a permissions file, creating it with a commented template first.
+     * Without a scope, asks which one (or opens the only existing file).
+     */
+    async openPermissions(scope?: 'user' | 'workspace'): Promise<void> {
+        const files = this.getPermissionFiles();
+        let file = scope ? files.find((f) => f.scope === scope) : undefined;
+        if (!file) {
+            const pick = await vscode.window.showQuickPick(
+                files.map((f) => ({
+                    label: f.scope === 'workspace' ? '$(folder) This workspace' : '$(globe) All projects',
+                    description: f.exists ? `${f.ruleCount} rules` : 'not created yet',
+                    detail: f.filePath,
+                    file: f,
+                })),
+                { title: 'Kiro Permissions' }
+            );
+            if (!pick) {
+                return;
+            }
+            file = pick.file;
+        }
+        const uri = vscode.Uri.file(file.filePath);
+        if (!file.exists) {
+            await vscode.workspace.fs.createDirectory(vscode.Uri.file(path.dirname(file.filePath)));
+            const template = permissionsTemplate(file.scope, file.scope === 'workspace' ? this._cliManager.currentWorkingDirectory : undefined);
+            await vscode.workspace.fs.writeFile(uri, Buffer.from(template, 'utf-8'));
+            this.refresh();
+        }
+        await vscode.window.showTextDocument(uri, { preview: false });
     }
 
     private _group(id: GroupId, label: string, icon: string, count: number, children: () => Node[]): Node {
         const item = new vscode.TreeItem(
             label,
-            id === 'rules' || id === 'specs' ? vscode.TreeItemCollapsibleState.Expanded : vscode.TreeItemCollapsibleState.Collapsed
+            id === 'rules' || id === 'specs' || id === 'permissions' ? vscode.TreeItemCollapsibleState.Expanded : vscode.TreeItemCollapsibleState.Collapsed
         );
         item.id = `kiro.overview.${id}`;
         item.description = String(count);
@@ -121,16 +181,11 @@ export class KiroOverviewProvider implements vscode.TreeDataProvider<Node>, vsco
 
     private _ruleNodes(config: KiroConfig): Node[] {
         // Always offer these — the view's title buttons only show on hover
-        const add = hintNode(
-            'Add a rule…',
-            'Rules are Markdown files that tell Kiro your conventions (coding style, testing, architecture).',
-            { command: 'kiro.newRule', title: 'Add Rule' }
-        );
-        const openFolder = hintNode(
-            'Open rules folder…',
-            'Show .kiro/steering (project) in VS Code\'s Explorer, or list the files in ~/.kiro/steering (global).',
-            { command: 'kiro.openRulesFolder', title: 'Open Rules Folder' }
-        );
+        const add = hintNode('New rule…', 'Your conventions for Kiro', { command: 'kiro.newRule', title: 'New Rule' });
+        const openFolder = hintNode('Open folder…', '.kiro/steering or ~/.kiro/steering', {
+            command: 'kiro.openRulesFolder',
+            title: 'Open Rules Folder',
+        });
         openFolder.item.iconPath = new vscode.ThemeIcon('folder-opened');
         if (!config.rules.length) {
             return [add, openFolder];
@@ -149,11 +204,10 @@ export class KiroOverviewProvider implements vscode.TreeDataProvider<Node>, vsco
     }
 
     private _specNodes(config: KiroConfig): Node[] {
-        const plan = hintNode(
-            'Plan a feature…',
-            'A spec is a plan Kiro writes with you before coding: requirements (what), design (how), and tasks (step-by-step). Saved to .kiro/specs/.',
-            { command: 'kiro.startSpec', title: 'Plan a Feature' }
-        );
+        const plan = hintNode('Plan a feature…', 'Requirements → design → tasks', {
+            command: 'kiro.startSpec',
+            title: 'Plan a Feature',
+        });
         if (!config.specs.length) {
             return [plan];
         }
@@ -161,13 +215,10 @@ export class KiroOverviewProvider implements vscode.TreeDataProvider<Node>, vsco
             const item = new vscode.TreeItem(spec.name, vscode.TreeItemCollapsibleState.Collapsed);
             item.description = `${spec.docs.length} of 3 docs`;
             item.iconPath = new vscode.ThemeIcon(spec.docs.length === 3 ? 'pass-filled' : 'circle-large-outline');
-            item.tooltip = `${spec.dir}\n\nAsk in the chat: "implement task 1 from the ${spec.name} spec"`;
+            item.tooltip = spec.dir;
             return {
                 item,
-                children: () =>
-                    spec.docs.map((d) =>
-                        fileNode(`${d.phase}.md`, d.filePath, d.phase === 'requirements' ? 'what to build' : d.phase === 'design' ? 'how to build it' : 'step-by-step', 'markdown')
-                    ),
+                children: () => spec.docs.map((d) => fileNode(`${d.phase}.md`, d.filePath, '', 'markdown')),
             };
         });
         return [...specNodes, plan];
@@ -338,9 +389,10 @@ export class KiroOverviewProvider implements vscode.TreeDataProvider<Node>, vsco
     }
 
     private _watch(kiroDir: string): vscode.FileSystemWatcher {
-        // Watch the folder containing .kiro so creating `.kiro/` itself is noticed
+        // Watch the folder containing .kiro so creating `.kiro/` itself is noticed.
+        // workspace-roots holds V3 workspace permissions (only under ~/.kiro).
         const watcher = vscode.workspace.createFileSystemWatcher(
-            new vscode.RelativePattern(vscode.Uri.file(path.dirname(kiroDir)), `${path.basename(kiroDir)}/{steering,specs,agents,skills,settings}/**`)
+            new vscode.RelativePattern(vscode.Uri.file(path.dirname(kiroDir)), `${path.basename(kiroDir)}/{steering,specs,agents,skills,settings,workspace-roots}/**`)
         );
         watcher.onDidCreate(() => this.refresh());
         watcher.onDidChange(() => this.refresh());
@@ -358,12 +410,12 @@ export class KiroOverviewProvider implements vscode.TreeDataProvider<Node>, vsco
 function whenText(rule: Rule): string {
     switch (rule.inclusion) {
         case 'always':
-            return 'Applied to every message.';
+            return 'Every message';
         case 'auto':
-            return 'Loaded by kiro-cli; Kiro decides when it is relevant.';
+            return 'When Kiro thinks it is relevant';
         case 'fileMatch':
-            return `Applied when the active file matches: ${rule.patterns.map((p) => `\`${p}\``).join(', ') || '(no pattern set)'}.`;
+            return `Files matching ${rule.patterns.map((p) => `\`${p}\``).join(', ') || '(no pattern)'}`;
         case 'manual':
-            return `Applied when you type \`#${rule.name}\` in the chat.`;
+            return `When you type \`#${rule.name}\``;
     }
 }

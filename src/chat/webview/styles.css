@@ -117,6 +117,19 @@ body {
     color: var(--vscode-textLink-foreground, #3794ff);
 }
 
+.cwd-indicator.locked {
+    cursor: default;
+}
+
+.cwd-indicator.locked:hover {
+    color: var(--vscode-descriptionForeground, #999);
+    background-color: var(--vscode-sideBar-background, #252526);
+}
+
+.cwd-indicator.locked .cwd-change {
+    color: inherit;
+}
+
 /* ---- Context Usage Indicator ---- */
 
 .context-usage {
@@ -258,6 +271,102 @@ body {
     border-left: 2px solid var(--vscode-descriptionForeground, #999);
     margin: 4px 0;
     opacity: 0.8;
+    /* /help and /model output span several lines */
+    white-space: pre-wrap;
+}
+
+/* ---- Tool permission cards ---- */
+
+.permission-card {
+    margin: 8px 0;
+    padding: 10px 12px;
+    border: 1px solid var(--vscode-focusBorder, #007fd4);
+    border-radius: 4px;
+    background-color: var(--vscode-editorWidget-background, rgba(127, 127, 127, 0.08));
+}
+
+.permission-card.resolved {
+    border-color: var(--vscode-panel-border, rgba(127, 127, 127, 0.3));
+    opacity: 0.8;
+}
+
+.permission-heading {
+    font-weight: 600;
+    margin-bottom: 6px;
+}
+
+.permission-resource {
+    display: block;
+    padding: 4px 6px;
+    margin-bottom: 8px;
+    font-family: var(--vscode-editor-font-family, monospace);
+    font-size: 12px;
+    white-space: pre-wrap;
+    word-break: break-all;
+    background-color: var(--vscode-textCodeBlock-background, rgba(127, 127, 127, 0.15));
+    border-radius: 3px;
+}
+
+.permission-scope {
+    display: block;
+    font-size: 12px;
+    color: var(--vscode-descriptionForeground, #999);
+    margin-bottom: 8px;
+}
+
+.permission-scope select {
+    margin-left: 4px;
+    color: var(--vscode-dropdown-foreground, inherit);
+    background-color: var(--vscode-dropdown-background, transparent);
+    border: 1px solid var(--vscode-dropdown-border, rgba(127, 127, 127, 0.4));
+}
+
+.permission-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+}
+
+.permission-btn {
+    padding: 4px 10px;
+    border: 1px solid transparent;
+    border-radius: 2px;
+    cursor: pointer;
+    font-size: 12px;
+}
+
+.permission-btn.allow {
+    color: var(--vscode-button-foreground, #fff);
+    background-color: var(--vscode-button-background, #0e639c);
+}
+
+.permission-btn.allow:hover:not(:disabled) {
+    background-color: var(--vscode-button-hoverBackground, #1177bb);
+}
+
+.permission-btn.reject {
+    color: var(--vscode-button-secondaryForeground, inherit);
+    background-color: var(--vscode-button-secondaryBackground, rgba(127, 127, 127, 0.25));
+}
+
+.permission-btn.reject:hover:not(:disabled) {
+    background-color: var(--vscode-button-secondaryHoverBackground, rgba(127, 127, 127, 0.35));
+}
+
+.permission-btn:focus-visible,
+.permission-scope select:focus-visible {
+    outline: 1px solid var(--vscode-focusBorder, #007fd4);
+    outline-offset: 1px;
+}
+
+.permission-btn:disabled {
+    opacity: 0.6;
+    cursor: default;
+}
+
+.permission-result {
+    font-size: 12px;
+    color: var(--vscode-descriptionForeground, #999);
 }
 
 /* ---- Markdown Rendering ---- */
@@ -536,6 +645,39 @@ body {
     border-color: var(--vscode-foreground, #ccc);
 }
 
+/* ---- Queued Messages (sent while Kiro is working) ---- */
+
+.queued-messages {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 8px 16px;
+    border-top: 1px solid var(--vscode-panel-border, #444);
+    max-height: 30vh;
+    overflow-y: auto;
+}
+
+.queued-messages.hidden {
+    display: none;
+}
+
+.message.user.queued {
+    opacity: 0.7;
+    border-style: dashed;
+}
+
+.message-note {
+    display: block;
+    margin-top: 4px;
+    font-size: 11px;
+    font-style: italic;
+    color: var(--vscode-descriptionForeground, #999);
+}
+
+.message.user.not-sent {
+    opacity: 0.6;
+}
+
 /* ---- Input Area ---- */
 
 .input-area {
@@ -591,22 +733,61 @@ body {
     cursor: default;
 }
 
-
-/* ---- Tool Status ---- */
-
-.tool-status {
+/* Shown while Kiro is working; Send stays available for queueing */
+.stop-btn {
     display: flex;
     align-items: center;
-    gap: 6px;
-    padding: 4px 12px;
-    font-size: 12px;
-    color: var(--vscode-descriptionForeground, #999);
-    border-left: 2px solid var(--vscode-textLink-foreground, #3794ff);
-    margin: 4px 0;
-    opacity: 0.8;
+    justify-content: center;
+    width: 32px;
+    height: 32px;
+    padding: 0;
+    border: 1px solid var(--vscode-button-border, transparent);
+    border-radius: 4px;
+    background-color: var(--vscode-button-secondaryBackground, #3a3d41);
+    color: var(--vscode-button-secondaryForeground, #fff);
+    cursor: pointer;
+    flex-shrink: 0;
 }
 
-.tool-status.completed {
-    border-left-color: var(--vscode-testing-iconPassed, #73c991);
-    color: var(--vscode-testing-iconPassed, #73c991);
+.stop-btn:hover {
+    background-color: var(--vscode-button-secondaryHoverBackground, #45494e);
+}
+
+.stop-btn:focus-visible,
+.send-btn:focus-visible {
+    outline: 1px solid var(--vscode-focusBorder, #007fd4);
+    outline-offset: 2px;
+}
+
+.stop-btn.hidden {
+    display: none;
+}
+
+
+/* ---- Markdown tables ---- */
+
+.message table {
+    border-collapse: collapse;
+    margin: 8px 0;
+    display: block;
+    overflow-x: auto;
+}
+
+.message th,
+.message td {
+    border: 1px solid var(--vscode-panel-border, #444);
+    padding: 3px 8px;
+    text-align: left;
+}
+
+.message th {
+    background-color: var(--vscode-textCodeBlock-background, #1e1e1e);
+    font-weight: 600;
+}
+
+.message blockquote {
+    margin: 4px 0;
+    padding-left: 10px;
+    border-left: 3px solid var(--vscode-textBlockQuote-border, #555);
+    color: var(--vscode-descriptionForeground, #999);
 }
