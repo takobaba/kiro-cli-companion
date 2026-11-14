@@ -98,7 +98,7 @@ suite('Kiro terminal', () => {
             assert.strictEqual(created.length, 1);
             const opts = created[0];
             assert.strictEqual(opts.shellPath, '/opt/kiro/kiro-cli');
-            assert.deepStrictEqual(opts.shellArgs, ['chat']);
+            assert.deepStrictEqual(opts.shellArgs, ['chat', '--v3']);
             assert.strictEqual(opts.cwd, manager.currentWorkingDirectory);
             assert.deepStrictEqual(opts.location, { viewColumn: vscode.ViewColumn.Beside, preserveFocus: false });
             assert.ok(terminals.isRunning);
@@ -165,7 +165,7 @@ suite('Kiro terminal', () => {
             await terminals.start({ name: 'Kiro Spec: x', prompt: 'plan it' });
             assert.strictEqual(created.length, 2);
             assert.strictEqual(created[1].name, 'Kiro Spec: x');
-            assert.deepStrictEqual(created[1].shellArgs, ['chat', 'plan it']);
+            assert.deepStrictEqual(created[1].shellArgs, ['chat', '--v3', 'plan it']);
         });
 
         test('adds kiro.chatArguments before the prompt', async () => {
@@ -173,10 +173,21 @@ suite('Kiro terminal', () => {
             const realGet = config.get.bind(config);
             sandbox.stub(vscode.workspace, 'getConfiguration').returns({
                 ...config,
-                get: (key: string, def?: unknown) => (key === 'chatArguments' ? ['--v3', '', 7] : realGet(key, def)),
+                get: (key: string, def?: unknown) => (key === 'chatArguments' ? ['--agent', 'mine', '', 7] : realGet(key, def)),
             } as unknown as vscode.WorkspaceConfiguration);
             await terminals.start({ prompt: 'hi' });
-            assert.deepStrictEqual(created[0].shellArgs, ['chat', '--v3', 'hi']);
+            assert.deepStrictEqual(created[0].shellArgs, ['chat', '--v3', '--agent', 'mine', 'hi']);
+        });
+
+        test('an engine chosen in kiro.chatArguments replaces the default --v3', async () => {
+            const config = vscode.workspace.getConfiguration('kiro');
+            const realGet = config.get.bind(config);
+            sandbox.stub(vscode.workspace, 'getConfiguration').returns({
+                ...config,
+                get: (key: string, def?: unknown) => (key === 'chatArguments' ? ['--v2'] : realGet(key, def)),
+            } as unknown as vscode.WorkspaceConfiguration);
+            await terminals.open();
+            assert.deepStrictEqual(created[0].shellArgs, ['chat', '--v2']);
         });
     });
 });

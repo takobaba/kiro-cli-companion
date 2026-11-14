@@ -59,6 +59,19 @@ export function chatArgumentsFromSetting(): string[] {
     return Array.isArray(value) ? value.filter((v): v is string => typeof v === 'string' && v.trim() !== '') : [];
 }
 
+/** kiro-cli chat flags that pick the agent engine. */
+const ENGINE_FLAGS = new Set(['--v2', '--v3', '--agent-engine']);
+
+/**
+ * Adds `--v3` unless the arguments already choose an engine. Without a flag,
+ * kiro-cli can still start V2 (a 2.0 user who hasn't picked an engine, a
+ * `chat.agentEngine` of v2), so the extension asks for V3 explicitly.
+ */
+export function withV3Engine(args: string[]): string[] {
+    const choosesEngine = args.some((a) => ENGINE_FLAGS.has(a) || a.startsWith('--agent-engine='));
+    return choosesEngine ? args : ['--v3', ...args];
+}
+
 export interface StartOptions {
     /** Terminal tab title. */
     name?: string;
@@ -155,7 +168,7 @@ export class KiroTerminalManager implements vscode.Disposable {
         }
         const cwd = (await this._cliManager.resolveWorkingDirectory(true)).path;
 
-        const args = ['chat', ...chatArgumentsFromSetting()];
+        const args = ['chat', ...withV3Engine(chatArgumentsFromSetting())];
         if (options.prompt) {
             args.push(options.prompt);
         }

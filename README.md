@@ -28,7 +28,7 @@ Manage everything [Kiro](https://kiro.dev) uses from the VS Code sidebar, and ch
 
 - `kiro.cliPath`: path to `kiro-cli` (auto-detected if empty).
 - `kiro.workingDirectory`: folder `kiro-cli` starts in.
-- `kiro.chatArguments`: extra `kiro-cli chat` arguments, e.g. `["--v3"]` or `["--agent", "my-agent"]`.
+- `kiro.chatArguments`: extra `kiro-cli chat` arguments, e.g. `["--agent", "my-agent"]`. Chat uses `--v3` unless you pass `--v2`.
 
 ## Troubleshooting
 

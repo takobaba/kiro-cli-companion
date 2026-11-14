@@ -2,7 +2,7 @@
     "name": "kiro-cli-companion",
     "displayName": "Kiro CLI Companion",
     "description": "Unofficial companion for the Kiro CLI: manage the rules, specs, permissions, agents, skills and MCP servers Kiro uses from the sidebar, and chat with kiro-cli in a terminal beside your code. Requires kiro-cli from kiro.dev.",
-    "version": "0.1.0",
+    "version": "0.1.1",
     "publisher": "takobaba",
     "author": "Takobaba",
     "license": "MIT",
@@ -101,7 +101,7 @@
                     },
                     "default": [],
                     "scope": "machine",
-                    "markdownDescription": "Extra arguments for `kiro-cli chat` when the Kiro terminal starts, e.g. `[\"--v3\"]`, `[\"--agent\", \"my-agent\"]` or `[\"--model\", \"<model>\"]`. Run `kiro-cli chat --help` for the full list. User settings only: a workspace can't set this."
+                    "markdownDescription": "Extra arguments for `kiro-cli chat` when the Kiro terminal starts, e.g. `[\"--agent\", \"my-agent\"]` or `[\"--model\", \"<model>\"]`. The extension always starts the V3 engine (`--v3`) unless these arguments pick one (`--v2`, `--v3`, `--agent-engine`). Run `kiro-cli chat --help` for the full list. User settings only: a workspace can't set this."
                 },
                 "kiro.workingDirectory": {
                     "type": "string",
