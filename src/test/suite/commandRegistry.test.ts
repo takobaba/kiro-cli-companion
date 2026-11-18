@@ -65,6 +65,8 @@ suite('CommandRegistry', () => {
         const ids = registerCommandStub.getCalls().map((c: sinon.SinonSpyCall) => c.args[0]);
         assert.deepStrictEqual(ids, [
             'kiro.openChat',
+            'kiro.newChat',
+            'kiro.resumeSession',
             'kiro.startSpec',
             'kiro.restartCli',
             'kiro.login',

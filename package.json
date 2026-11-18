@@ -2,7 +2,7 @@
     "name": "kiro-cli-companion",
     "displayName": "Kiro CLI Companion",
     "description": "Unofficial companion for the Kiro CLI: manage the rules, specs, permissions, agents, skills and MCP servers Kiro uses from the sidebar, and chat with kiro-cli in a terminal beside your code. Requires kiro-cli from kiro.dev.",
-    "version": "0.1.1",
+    "version": "0.2.0",
     "publisher": "takobaba",
     "author": "Takobaba",
     "license": "MIT",
@@ -39,6 +39,14 @@
             {
                 "command": "kiro.openChat",
                 "title": "Kiro: Open Chat"
+            },
+            {
+                "command": "kiro.newChat",
+                "title": "Kiro: New Chat"
+            },
+            {
+                "command": "kiro.resumeSession",
+                "title": "Kiro: Resume Session..."
             },
             {
                 "command": "kiro.startSpec",
@@ -94,6 +102,22 @@
                     "scope": "machine",
                     "markdownDescription": "Full path to the `kiro-cli` executable (or the directory containing it). Leave empty to auto-detect from `KIRO_CLI_PATH`, `PATH`, the Windows user/system PATH, and common install locations such as `%LOCALAPPDATA%\\Kiro-Cli\\kiro-cli.exe` or `~/.local/bin/kiro-cli`."
                 },
+                "kiro.chatSession": {
+                    "type": "string",
+                    "enum": [
+                        "resume",
+                        "pick",
+                        "new"
+                    ],
+                    "enumDescriptions": [
+                        "Continue the latest saved session in the working directory (kiro-cli chat --resume).",
+                        "Ask which saved session to continue, or start a new one.",
+                        "Always start a new session."
+                    ],
+                    "default": "resume",
+                    "scope": "window",
+                    "markdownDescription": "Which conversation **Kiro: Open Chat** opens when the Kiro terminal isn't already running. kiro-cli saves every turn, so a closed terminal or a VS Code restart loses nothing. **Kiro: New Chat** and **Kiro: Resume Session...** override this once."
+                },
                 "kiro.chatArguments": {
                     "type": "array",
                     "items": {
@@ -137,7 +161,7 @@
         "viewsWelcome": [
             {
                 "view": "kiro.launcher",
-                "contents": "Opens kiro-cli in a terminal beside your code.\n[Open Chat](command:kiro.openChat)\nPlan before you develop!\n[Spec](command:kiro.startSpec)\nRules tell Kiro how to work and develop.\n[New Rule](command:kiro.newRule)\nSet it once!\n[Select Working Directory](command:kiro.selectWorkingDirectory)\n[Restart CLI](command:kiro.restartCli)\nNot signed in? [Log in](command:kiro.login) or [use an API key](command:kiro.setApiKey)."
+                "contents": "Opens kiro-cli in a terminal beside your code.\n[Open Chat](command:kiro.openChat)\nContinues your last session. [Resume another](command:kiro.resumeSession) or start a [new chat](command:kiro.newChat).\nPlan before you develop!\n[Spec](command:kiro.startSpec)\nRules tell Kiro how to work and develop.\n[New Rule](command:kiro.newRule)\nSet it once!\n[Select Working Directory](command:kiro.selectWorkingDirectory)\n[Restart CLI](command:kiro.restartCli)\nNot signed in? [Log in](command:kiro.login) or [use an API key](command:kiro.setApiKey)."
             }
         ],
         "menus": {

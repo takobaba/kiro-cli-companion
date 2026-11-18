@@ -9,6 +9,7 @@ import { execFile } from 'child_process';
 import * as pathModule from 'path';
 import { CliState } from '../types';
 import { cliSpawnTarget, getHomeDir, isExecutableFile, locateCli } from './cliLocator';
+import { KiroSession, parseSessionList } from '../terminal/sessions';
 import {
     ResolvedWorkingDirectory,
     WORKING_DIRECTORY_STATE_KEY,
@@ -189,6 +190,39 @@ export class CliManager implements vscode.Disposable {
                     resolve(true);
                 }
             });
+        });
+    }
+
+    /**
+     * Saved chat sessions for `cwd`, newest first, from
+     * `kiro-cli chat --list-sessions -f json`. Returns undefined if the
+     * list couldn't be read (CLI missing, older CLI, unexpected output).
+     */
+    async listSessions(cwd: string): Promise<KiroSession[] | undefined> {
+        const cliPath = this._resolvedCliPath ?? (await this.resolveCliPath());
+        if (!cliPath) {
+            return undefined;
+        }
+        const target = cliSpawnTarget(cliPath);
+        return new Promise((resolve) => {
+            execFile(
+                target.command,
+                ['chat', '--list-sessions', '--format', 'json'],
+                { cwd, timeout: 15000, shell: target.shell, windowsHide: true, env: this._childEnv(), maxBuffer: 16 * 1024 * 1024 },
+                (error, stdout, stderr) => {
+                    if (error) {
+                        _log.appendLine(`[CliManager] list-sessions failed: ${error.message}${stderr ? ` — ${stderr.trim()}` : ''}`);
+                        resolve(undefined);
+                        return;
+                    }
+                    try {
+                        resolve(parseSessionList(stdout));
+                    } catch (err) {
+                        _log.appendLine(`[CliManager] list-sessions returned unexpected output: ${err instanceof Error ? err.message : err}`);
+                        resolve(undefined);
+                    }
+                }
+            );
         });
     }
 

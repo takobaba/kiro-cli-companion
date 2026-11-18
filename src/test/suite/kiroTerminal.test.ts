@@ -4,10 +4,12 @@
 
 import * as assert from 'assert';
 import * as sinon from 'sinon';
+import * as cp from 'child_process';
 import * as vscode from 'vscode';
 import { CliManager } from '../../cli/cliManager';
 import { KiroTerminalManager, buildTerminalLaunch } from '../../terminal/kiroTerminal';
 import { buildSpecPrompt } from '../../spec/specWorkflowManager';
+import { KiroSession } from '../../terminal/sessions';
 
 suite('Kiro terminal', () => {
     suite('buildTerminalLaunch', () => {
@@ -70,12 +72,19 @@ suite('Kiro terminal', () => {
         let manager: CliManager;
         let terminals: KiroTerminalManager;
         let created: vscode.TerminalOptions[];
-        let fakes: { exitStatus: vscode.TerminalExitStatus | undefined }[];
+        let fakes: { exitStatus: vscode.TerminalExitStatus | undefined; dispose: sinon.SinonStub }[];
+        /** What `kiro-cli chat --list-sessions` reports (undefined: couldn't be read). */
+        let saved: KiroSession[] | undefined;
+        /** Overrides for `kiro.*` settings. */
+        let settings: Record<string, unknown>;
+        const session = (id: string, title = id): KiroSession => ({ id, title, updatedAt: new Date() });
 
         setup(async () => {
             sandbox = sinon.createSandbox();
             created = [];
             fakes = [];
+            saved = [];
+            settings = {};
             sandbox.stub(vscode.window, 'createTerminal').callsFake(((options: vscode.TerminalOptions) => {
                 created.push(options);
                 const fake = { show: sandbox.stub(), dispose: sandbox.stub(), name: options.name, exitStatus: undefined };
@@ -84,6 +93,13 @@ suite('Kiro terminal', () => {
             }) as never);
             manager = new CliManager({ cliPath: '/opt/kiro/kiro-cli' });
             await manager.resolveCliPath();
+            sandbox.stub(manager, 'listSessions').callsFake(async () => saved);
+            const config = vscode.workspace.getConfiguration('kiro');
+            const realGet = config.get.bind(config);
+            sandbox.stub(vscode.workspace, 'getConfiguration').returns({
+                ...config,
+                get: (key: string, def?: unknown) => (key in settings ? settings[key] : realGet(key, def)),
+            } as unknown as vscode.WorkspaceConfiguration);
             terminals = new KiroTerminalManager(manager, vscode.Uri.file('/ext'));
         });
 
@@ -169,25 +185,64 @@ suite('Kiro terminal', () => {
         });
 
         test('adds kiro.chatArguments before the prompt', async () => {
-            const config = vscode.workspace.getConfiguration('kiro');
-            const realGet = config.get.bind(config);
-            sandbox.stub(vscode.workspace, 'getConfiguration').returns({
-                ...config,
-                get: (key: string, def?: unknown) => (key === 'chatArguments' ? ['--agent', 'mine', '', 7] : realGet(key, def)),
-            } as unknown as vscode.WorkspaceConfiguration);
+settings.chatArguments = ['--agent', 'mine', '', 7];
             await terminals.start({ prompt: 'hi' });
             assert.deepStrictEqual(created[0].shellArgs, ['chat', '--v3', '--agent', 'mine', 'hi']);
         });
 
         test('an engine chosen in kiro.chatArguments replaces the default --v3', async () => {
-            const config = vscode.workspace.getConfiguration('kiro');
-            const realGet = config.get.bind(config);
-            sandbox.stub(vscode.workspace, 'getConfiguration').returns({
-                ...config,
-                get: (key: string, def?: unknown) => (key === 'chatArguments' ? ['--v2'] : realGet(key, def)),
-            } as unknown as vscode.WorkspaceConfiguration);
+            settings.chatArguments = ['--v2'];
             await terminals.open();
             assert.deepStrictEqual(created[0].shellArgs, ['chat', '--v2']);
+        });
+
+        suite('sessions', () => {
+            test('Open Chat continues the latest saved session', async () => {
+                saved = [session('sess_a')];
+                await terminals.open();
+                assert.deepStrictEqual(created[0].shellArgs, ['chat', '--v3', '--resume']);
+            });
+
+            test('Open Chat starts fresh when the directory has no saved session', async () => {
+                saved = [];
+                await terminals.open();
+                assert.deepStrictEqual(created[0].shellArgs, ['chat', '--v3']);
+            });
+
+
+
+
+
+            test('New Chat replaces the terminal with a fresh session', async () => {
+                saved = [session('sess_a')];
+                await terminals.open();
+                await terminals.newChat();
+                assert.ok(fakes[0].dispose.calledOnce);
+                assert.deepStrictEqual(created[1].shellArgs, ['chat', '--v3']);
+                assert.ok(terminals.isRunning);
+            });
+
+            test('Resume Session waits for the old kiro-cli to exit before resuming', async () => {
+                saved = [session('sess_a'), session('sess_b')];
+                await terminals.open();
+                // A real process that is still running, then exits when the terminal is closed
+                const child = cp.spawn(process.execPath, ['-e', 'setTimeout(() => {}, 60000)']);
+                Object.assign(fakes[0], { processId: Promise.resolve(child.pid) });
+                fakes[0].dispose.callsFake(() => setTimeout(() => child.kill(), 300));
+                const closedAt = Date.now();
+                sandbox.stub(vscode.window, 'showQuickPick').callsFake((async (items: readonly vscode.QuickPickItem[]) =>
+                    items.find((i) => i.detail === 'sess_b')) as never);
+                const createTerminal = vscode.window.createTerminal as sinon.SinonStub;
+                createTerminal.callsFake(((options: vscode.TerminalOptions) => {
+                    assert.throws(() => process.kill(child.pid!, 0), 'started before the old kiro-cli exited');
+                    assert.ok(Date.now() - closedAt >= 250);
+                    created.push(options);
+                    return { show: sandbox.stub(), dispose: sandbox.stub(), exitStatus: undefined } as unknown as vscode.Terminal;
+                }) as never);
+                await terminals.resumeSession();
+                assert.deepStrictEqual(created[1].shellArgs, ['chat', '--v3', '--resume-id', 'sess_b']);
+            });
+
         });
     });
 });

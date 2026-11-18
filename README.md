@@ -21,6 +21,7 @@ Manage everything [Kiro](https://kiro.dev) uses from the VS Code sidebar, and ch
 ## Chat and specs
 
 - **Chat:** **Kiro: Open Chat** runs `kiro-cli chat` in a terminal beside your editor. Every `kiro-cli` chat feature works as-is: slash commands, models, agents and tool permissions.
+- **Sessions:** `kiro-cli` saves every turn, so closing the terminal or VS Code loses nothing. **Open Chat** continues the latest session in the working directory (`kiro-cli chat --resume`). **Kiro: Resume Session...** picks a different saved session, and **Kiro: New Chat** starts over.
 - **Plan a Feature (Spec):** starts a Kiro chat that writes requirements → design → tasks to `.kiro/specs/<name>/`, asking Kiro to stop for your review after each step. The spec shows up in the sidebar as it's written.
 - **API key:** **Kiro: Set API Key** stores it in VS Code SecretStorage and passes it to `kiro-cli` as `KIRO_API_KEY`.
 
@@ -28,12 +29,13 @@ Manage everything [Kiro](https://kiro.dev) uses from the VS Code sidebar, and ch
 
 - `kiro.cliPath`: path to `kiro-cli` (auto-detected if empty).
 - `kiro.workingDirectory`: folder `kiro-cli` starts in.
+- `kiro.chatSession`: what **Open Chat** opens: `resume` the latest session (default), `pick` one each time, or always start `new`.
 - `kiro.chatArguments`: extra `kiro-cli chat` arguments, e.g. `["--agent", "my-agent"]`. Chat uses `--v3` unless you pass `--v2`.
 
 ## Troubleshooting
 
 - **CLI not found:** see **Output → Kiro CLI**, then set `kiro.cliPath`.
-- **Stuck or signed out:** run **Kiro: Restart CLI** for a fresh session.
+- **Stuck or signed out:** run **Kiro: Restart CLI**. It restarts `kiro-cli` and continues the same conversation. Use **Kiro: New Chat** for a clean slate.
 
 ## License
 

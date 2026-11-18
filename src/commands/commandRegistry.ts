@@ -28,6 +28,12 @@ export class CommandRegistry implements vscode.Disposable {
             vscode.commands.registerCommand('kiro.openChat', () =>
                 this._runIfCliAvailable(() => this._terminals.open())
             ),
+            vscode.commands.registerCommand('kiro.newChat', () =>
+                this._runIfCliAvailable(() => this._terminals.newChat())
+            ),
+            vscode.commands.registerCommand('kiro.resumeSession', () =>
+                this._runIfCliAvailable(() => this._terminals.resumeSession())
+            ),
             vscode.commands.registerCommand('kiro.startSpec', () =>
                 this._runIfCliAvailable(() => this._specWorkflowManager.startWorkflow())
             ),
@@ -64,8 +70,8 @@ export class CommandRegistry implements vscode.Disposable {
     }
 
     /**
-     * Re-detects the CLI, logs in if needed, then replaces the Kiro terminal
-     * with a fresh kiro-cli session.
+     * Re-detects the CLI, logs in if needed, then restarts kiro-cli in the
+     * Kiro terminal, continuing the latest session.
      */
     private async _handleRestartCli(): Promise<void> {
         try {
