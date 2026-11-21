@@ -101,6 +101,87 @@ export function readPermissionFiles(home: string, workspaceRoot: string): Permis
     ];
 }
 
+/** One folder under ~/.kiro/workspace-roots/. */
+export interface WorkspaceRootEntry {
+    hash: string;
+    dir: string;
+    /** Project folder the hash belongs to, when it can be worked out. */
+    root?: string;
+    file: PermissionsFile;
+    /** `workspaceTrusted: true` is set in the file. */
+    trusted: boolean;
+}
+
+export function workspaceRootsDir(home: string): string {
+    return path.join(home, '.kiro', 'workspace-roots');
+}
+
+/** True when a permissions file records `workspaceTrusted: true`. */
+export function isTrusted(text: string, isJson: boolean): boolean {
+    if (isJson) {
+        try {
+            return (JSON.parse(text) as { workspaceTrusted?: unknown }).workspaceTrusted === true;
+        } catch {
+            return false;
+        }
+    }
+    return /^workspaceTrusted\s*:\s*true\s*(#.*)?$/m.test(text);
+}
+
+/**
+ * Project folders kiro-cli has recorded for a hash, read from the session
+ * index (~/.kiro/sessions/<hash>/.index/index.json). Only paths whose hash
+ * matches are returned.
+ */
+function rootsFromSessionIndex(home: string, hash: string): string[] {
+    try {
+        const index = JSON.parse(fs.readFileSync(path.join(home, '.kiro', 'sessions', hash, '.index', 'index.json'), 'utf-8')) as {
+            entries?: { rootPaths?: unknown; workspacePaths?: unknown }[];
+        };
+        const paths = (index.entries ?? []).flatMap((e) => [
+            ...(Array.isArray(e.rootPaths) ? e.rootPaths : []),
+            ...(Array.isArray(e.workspacePaths) ? e.workspacePaths : []),
+        ]);
+        return paths.filter((p): p is string => typeof p === 'string' && p.trim() !== '');
+    } catch {
+        return [];
+    }
+}
+
+/**
+ * Every workspace folder under ~/.kiro/workspace-roots/, sorted by project
+ * path (unknown ones last). `knownRoots` are paths to try when kiro-cli's
+ * session index doesn't name a hash, e.g. open workspace folders.
+ */
+export function listWorkspaceRoots(home: string, knownRoots: string[] = []): WorkspaceRootEntry[] {
+    const base = workspaceRootsDir(home);
+    let names: string[];
+    try {
+        names = fs.readdirSync(base, { withFileTypes: true }).filter((d) => d.isDirectory()).map((d) => d.name);
+    } catch {
+        return [];
+    }
+    const known = new Map<string, string>();
+    for (const r of knownRoots) {
+        known.set(workspaceRootHash(r), r);
+    }
+    const entries = names.map((hash): WorkspaceRootEntry => {
+        const dir = path.join(base, hash);
+        const root = known.get(hash) ?? rootsFromSessionIndex(home, hash).find((r) => workspaceRootHash(r) === hash);
+        const file = readPermissionsFile('workspace', dir);
+        let trusted = false;
+        if (file.exists) {
+            try {
+                trusted = isTrusted(fs.readFileSync(file.filePath, 'utf-8'), file.filePath.endsWith('.json'));
+            } catch {
+                trusted = false;
+            }
+        }
+        return { hash, dir, root, file, trusted };
+    });
+    return entries.sort((a, b) => (a.root && b.root ? a.root.localeCompare(b.root) : a.root ? -1 : b.root ? 1 : a.hash.localeCompare(b.hash)));
+}
+
 /**
  * Counts rules and lists policies without a YAML dependency. Good enough for
  * a summary; kiro-cli itself is the authority on what the file means.

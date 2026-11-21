@@ -7,6 +7,8 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import {
+    isTrusted,
+    listWorkspaceRoots,
     normalizeWorkspaceRoot,
     readPermissionsFile,
     summarize,
@@ -48,6 +50,49 @@ suite('Permission files', () => {
         assert.deepStrictEqual(summarize(yaml, false), { ruleCount: 2, policies: ['approve-for-me'] });
         assert.deepStrictEqual(summarize('rules: []\nworkspaceTrusted: true\n', false), { ruleCount: 0, policies: [] });
         assert.deepStrictEqual(summarize('rules:\n- capability: all\n  effect: allow\npolicies: [dev-shell]\n', false), { ruleCount: 1, policies: ['dev-shell'] });
+    });
+
+    test('lists every workspace-roots folder and names its project', () => {
+        const home = fs.mkdtempSync(path.join(os.tmpdir(), 'kiro-home-'));
+        try {
+            const fromIndex = path.join(home, 'projects', 'alpha');
+            const fromKnown = path.join(home, 'projects', 'beta');
+            const add = (root: string | undefined, hash: string, text?: string) => {
+                const dir = path.join(home, '.kiro', 'workspace-roots', hash);
+                fs.mkdirSync(dir, { recursive: true });
+                if (text !== undefined) {
+                    fs.writeFileSync(path.join(dir, 'permissions.yaml'), text);
+                }
+                if (root) {
+                    const idx = path.join(home, '.kiro', 'sessions', hash, '.index');
+                    fs.mkdirSync(idx, { recursive: true });
+                    fs.writeFileSync(path.join(idx, 'index.json'), JSON.stringify({ entries: [{ rootPaths: [root] }] }));
+                }
+            };
+            add(fromIndex, workspaceRootHash(fromIndex), 'rules:\n  - capability: shell\n    effect: allow\nworkspaceTrusted: true\n');
+            add(undefined, workspaceRootHash(fromKnown), 'rules: []\n');
+            add(undefined, '0000000000000000');
+            // A session index naming a path with a different hash is ignored
+            add(path.join(home, 'elsewhere'), 'ffffffffffffffff', 'rules: []\n');
+
+            const roots = listWorkspaceRoots(home, [fromKnown]);
+            assert.deepStrictEqual(roots.map((r) => r.root), [fromIndex, fromKnown, undefined, undefined]);
+            assert.deepStrictEqual(roots.map((r) => r.hash).slice(2), ['0000000000000000', 'ffffffffffffffff']);
+            assert.strictEqual(roots[0].file.ruleCount, 1);
+            assert.strictEqual(roots[0].trusted, true);
+            assert.strictEqual(roots[1].trusted, false);
+            assert.strictEqual(roots[2].file.exists, false);
+            assert.deepStrictEqual(listWorkspaceRoots(path.join(home, 'missing')), []);
+        } finally {
+            fs.rmSync(home, { recursive: true, force: true });
+        }
+    });
+
+    test('reads workspaceTrusted', () => {
+        assert.strictEqual(isTrusted('rules: []\nworkspaceTrusted: true\n', false), true);
+        assert.strictEqual(isTrusted('# workspaceTrusted: true\nrules: []\n', false), false);
+        assert.strictEqual(isTrusted('{"workspaceTrusted":true}', true), true);
+        assert.strictEqual(isTrusted('not json', true), false);
     });
 
     test('summarizes JSON and reports missing files', () => {

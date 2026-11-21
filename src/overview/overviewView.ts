@@ -9,7 +9,14 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { CliManager } from '../cli/cliManager';
 import { getHomeDir } from '../cli/cliLocator';
-import { PermissionsFile, permissionsTemplate, readPermissionFiles } from '../permissions/permissions';
+import {
+    PermissionsFile,
+    listWorkspaceRoots,
+    permissionsTemplate,
+    readPermissionFiles,
+    workspaceRootHash,
+    workspaceRootsDir,
+} from '../permissions/permissions';
 import { Rule, RuleInclusion, describeInclusion, globalRulesDir, listRulesIn, newRuleTemplate, projectRulesDir } from '../rules/rules';
 import { KiroConfig, Scope, readKiroConfig } from './kiroConfig';
 
@@ -127,12 +134,46 @@ export class KiroOverviewProvider implements vscode.TreeDataProvider<Node>, vsco
                         arguments: [f.scope],
                     });
                 }
-                const parts = [`${f.ruleCount} rule${f.ruleCount === 1 ? '' : 's'}`, ...f.policies];
-                return fileNode(label, f.filePath, parts.join(' · '), f.scope === 'workspace' ? 'folder' : 'globe', f.filePath);
-            })
+                return fileNode(label, f.filePath, describePermissions(f), f.scope === 'workspace' ? 'folder' : 'globe', f.filePath);
+            }).concat(this._workspaceRootsNode())
         );
         group.item.tooltip = 'Tool rules for kiro-cli. Deny wins over allow.';
         return group;
+    }
+
+    /** Every folder under ~/.kiro/workspace-roots/, one per project kiro-cli has run in. */
+    private _workspaceRootsNode(): Node {
+        const cwd = this._cliManager.currentWorkingDirectory;
+        const known = [cwd, ...(vscode.workspace.workspaceFolders ?? []).map((f) => f.uri.fsPath)];
+        const roots = listWorkspaceRoots(getHomeDir(), known);
+        const currentHash = workspaceRootHash(cwd);
+        const item = new vscode.TreeItem('All workspaces', vscode.TreeItemCollapsibleState.Collapsed);
+        item.id = 'kiro.overview.permissions.workspaceRoots';
+        item.description = String(roots.length);
+        item.iconPath = new vscode.ThemeIcon('folder-library');
+        item.tooltip = `${workspaceRootsDir(getHomeDir())}\nPer-project permissions kiro-cli keeps outside each repository.`;
+        return {
+            item,
+            children: () =>
+                roots.length
+                    ? roots.map((r) => {
+                        const label = r.root ? path.basename(r.root) || r.root : r.hash;
+                        const parts = [
+                            ...(r.hash === currentHash ? ['current'] : []),
+                            ...(r.file.exists ? [describePermissions(r.file)] : ['no file']),
+                            ...(r.trusted ? ['trusted'] : []),
+                        ];
+                        const tooltip = `${r.root ?? 'Unknown project'}\n${r.file.exists ? r.file.filePath : r.dir}`;
+                        if (!r.file.exists) {
+                            const n = hintNode(label, tooltip);
+                            n.item.description = parts.join(' · ');
+                            n.item.iconPath = new vscode.ThemeIcon('folder');
+                            return n;
+                        }
+                        return fileNode(label, r.file.filePath, parts.join(' · '), r.hash === currentHash ? 'folder-active' : 'folder', tooltip);
+                    })
+                    : [hintNode('None', 'kiro-cli creates one per project it runs in')],
+        };
     }
 
     /**
@@ -405,6 +446,10 @@ export class KiroOverviewProvider implements vscode.TreeDataProvider<Node>, vsco
         this._watchedCwd = this._cliManager.currentWorkingDirectory;
         this._projectWatcher = this._watch(path.join(this._watchedCwd, '.kiro'));
     }
+}
+
+function describePermissions(f: PermissionsFile): string {
+    return [`${f.ruleCount} rule${f.ruleCount === 1 ? '' : 's'}`, ...f.policies].join(' · ');
 }
 
 function whenText(rule: Rule): string {
