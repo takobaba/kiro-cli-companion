@@ -2,7 +2,7 @@
     "name": "kiro-cli-companion",
     "displayName": "Kiro CLI Companion",
     "description": "Unofficial companion for the Kiro CLI: manage the rules, specs, permissions, agents, skills and MCP servers Kiro uses from the sidebar, and chat with kiro-cli in a terminal beside your code. Requires kiro-cli from kiro.dev.",
-    "version": "0.2.0",
+    "version": "0.2.1",
     "publisher": "takobaba",
     "author": "Takobaba",
     "license": "MIT",
